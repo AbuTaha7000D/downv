@@ -181,7 +181,7 @@ def test_process_playlist_processes_each_entry(monkeypatch, capsys):
         entries=[_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")],
     )
     calls = []
-    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry))
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry) or "downloaded")
     cli._process_playlist(info)
     assert [c["id"] for c in calls] == ["v1", "v2", "v3"]
     out = capsys.readouterr().out
@@ -193,7 +193,7 @@ def test_process_playlist_processes_each_entry(monkeypatch, capsys):
 def test_process_playlist_sequential_order(monkeypatch):
     info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
     calls = []
-    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry))
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry) or "downloaded")
     cli._process_playlist(info)
     assert [c["id"] for c in calls] == ["v1", "v2"]
 
@@ -201,7 +201,7 @@ def test_process_playlist_sequential_order(monkeypatch):
 def test_process_playlist_uses_single_video_pipeline(monkeypatch):
     info = _playlist_info(entries=[_resolved("v1", "One")])
     calls = []
-    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry))
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry) or "downloaded")
     cli._process_playlist(info)
     assert len(calls) == 1
     assert calls[0]["title"] == "One"
@@ -285,7 +285,7 @@ def test_process_playlist_lazy_generator_entries(monkeypatch):
 
     info = {"_type": "playlist", "title": "Lazy", "entries": gen()}
     calls = []
-    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry))
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry) or "downloaded")
     cli._process_playlist(info)
     assert [c["id"] for c in calls] == ["v1", "v2"]
 
@@ -296,7 +296,7 @@ def test_process_playlist_skips_malformed_entries(monkeypatch, capsys):
         entries=[None, "not-a-dict", {}, _resolved("v1", "One"), _resolved("v2", "Two")],
     )
     calls = []
-    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry))
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry) or "downloaded")
     cli._process_playlist(info)
     assert [c["id"] for c in calls] == ["v1", "v2"]
 
@@ -314,7 +314,7 @@ def test_process_playlist_failed_resolution_continues(monkeypatch, capsys):
         return entry
 
     monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
-    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry))
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry) or "downloaded")
     cli._process_playlist(info)
     assert [c["id"] for c in calls] == ["good"]
     out = capsys.readouterr().out
@@ -332,6 +332,7 @@ def test_process_playlist_failed_download_continues(monkeypatch, capsys):
         if info_entry["id"] == "v1":
             raise DownloadFailure("boom")
         calls.append(info_entry)
+        return "downloaded"
 
     monkeypatch.setattr(cli, "_download_video", flaky_download)
     cli._process_playlist(info)
@@ -409,3 +410,210 @@ def test_playlist_orchestration_does_not_touch_media(monkeypatch, tmp_path, caps
 
     assert media.exists()
     assert media.read_bytes() == b"original-content"
+
+
+def _summary(stats):
+    assert stats["total"] == stats["downloaded"] + stats["skipped"] + stats["failed"] + stats["unresolved"]
+    return stats
+
+
+def test_playlist_summary_all_downloaded(monkeypatch, capsys):
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")])
+    calls = []
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry) or "downloaded")
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 3, "downloaded": 3, "skipped": 0, "failed": 0, "unresolved": 0}
+    out = capsys.readouterr().out
+    assert "Playlist complete" in out
+    assert "Total      : 3" in out
+    assert "Downloaded : 3" in out
+    assert "Skipped    : 0" in out
+    assert "Failed     : 0" in out
+    assert "Unresolved : 0" in out
+
+
+def test_playlist_summary_mixed_results(monkeypatch, capsys):
+    info = _playlist_info(
+        title="Mixed",
+        entries=[
+            _resolved("d1", "Downloaded"),
+            _resolved("s1", "Skipped"),
+            _resolved("f1", "Failed"),
+            _partial("u1", "Unresolved"),
+        ],
+    )
+    calls = []
+    failed = {"f1"}
+
+    def fake_download(entry):
+        calls.append(entry["id"])
+        if entry["id"] in failed:
+            raise DownloadFailure("boom")
+        if entry["id"] in ("d1",):
+            return "downloaded"
+        if entry["id"] in ("s1",):
+            return "skipped"
+        return "failed"
+
+    def fake_resolve(entry):
+        if entry.get("id") == "u1":
+            return None
+        return entry
+
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    stats = _summary(cli._process_playlist(info))
+    assert calls == ["d1", "s1", "f1"]
+    assert stats == {"total": 4, "downloaded": 1, "skipped": 1, "failed": 1, "unresolved": 1}
+    out = capsys.readouterr().out
+    assert "Total      : 4" in out
+    assert "Downloaded : 1" in out
+    assert "Skipped    : 1" in out
+    assert "Failed     : 1" in out
+    assert "Unresolved : 1" in out
+
+
+def test_playlist_summary_empty(monkeypatch, capsys):
+    info = _playlist_info(title="Empty", entries=[])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
+    out = capsys.readouterr().out
+    assert "Playlist complete" in out
+    assert "Total      : 0" in out
+
+
+def test_playlist_summary_failed_item_does_not_stop_later_items(monkeypatch, capsys):
+    info = _playlist_info(entries=[_resolved("f1", "Fail"), _resolved("d1", "Done")])
+    calls = []
+    attempts = []
+
+    def flaky_download(entry):
+        attempts.append(entry["id"])
+        if entry["id"] == "f1":
+            raise DownloadFailure("boom")
+        calls.append(entry["id"])
+        return "downloaded"
+
+    monkeypatch.setattr(cli, "_download_video", flaky_download)
+    stats = _summary(cli._process_playlist(info))
+    assert attempts == ["f1", "d1"]
+    assert calls == ["d1"]
+    assert stats == {"total": 2, "downloaded": 1, "skipped": 0, "failed": 1, "unresolved": 0}
+
+
+def test_playlist_summary_cancel_no_completion(monkeypatch, capsys):
+    info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    monkeypatch.setattr(cli, "_download_video", lambda entry: pytest.fail("no download on cancel"))
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    monkeypatch.setattr(sys, "argv", ["downv"])
+    cli._run_download()
+    out = capsys.readouterr().out
+    assert "Download cancelled." in out
+    assert "Playlist complete" not in out
+    assert "Downloaded :" not in out
+
+
+def test_playlist_summary_accurate_counts(monkeypatch, capsys):
+    info = _playlist_info(
+        title="Mixed",
+        entries=[
+            _resolved("a1", "A"),
+            None,
+            _resolved("a2", "B"),
+            _resolved("a3", "C"),
+            "junk",
+            _partial("a4", "D"),
+        ],
+    )
+    calls = []
+
+    def fake_resolve(entry):
+        if not isinstance(entry, dict) or entry.get("id") == "a4":
+            return None
+        return entry
+
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry["id"]) or "downloaded")
+    stats = _summary(cli._process_playlist(info))
+    assert calls == ["a1", "a2", "a3"]
+    assert stats == {"total": 6, "downloaded": 3, "skipped": 0, "failed": 0, "unresolved": 3}
+
+
+def test_playlist_summary_lazy_generator_processed_once(monkeypatch, capsys):
+    produced = []
+
+    def gen():
+        for i in range(3):
+            produced.append(i)
+            yield _resolved(f"v{i}", f"Title {i}")
+
+    calls = []
+    info = {"_type": "playlist", "title": "Lazy", "entries": gen()}
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry["id"]) or "downloaded")
+    stats = _summary(cli._process_playlist(info))
+    assert produced == [0, 1, 2]
+    assert calls == ["v0", "v1", "v2"]
+    assert stats == {"total": 3, "downloaded": 3, "skipped": 0, "failed": 0, "unresolved": 0}
+    out = capsys.readouterr().out
+    assert "Total      : 3" in out
+
+
+def test_playlist_summary_no_playlist_level_history(monkeypatch, tmp_path, data_dir, capsys):
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+
+    def fake_download(entry, selected, output_dir):
+        history.record_download(
+            video_id=entry["id"],
+            title=entry["title"],
+            url=entry["webpage_url"],
+            filename=f"{entry['id']}.mp4",
+            filepath=str(output_dir / f"{entry['id']}.mp4"),
+            quality=selected.height,
+            duration=entry.get("duration"),
+            file_size=100,
+        )
+        return output_dir / f"{entry['id']}.mp4"
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "download_media", fake_download)
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 2, "downloaded": 2, "skipped": 0, "failed": 0, "unresolved": 0}
+    assert history.count_history() == 2
+    for record in history.get_download_history():
+        assert record["title"] != "My Playlist"
+
+
+def test_playlist_summary_single_video_unaffected(monkeypatch, tmp_path, data_dir, capsys):
+    info = _resolved("v1", "One")
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+
+    def fake_download(entry, selected, output_dir):
+        history.record_download(
+            video_id=entry["id"],
+            title=entry["title"],
+            url=entry["webpage_url"],
+            filename="one.mp4",
+            filepath=str(output_dir / "one.mp4"),
+            quality=selected.height,
+            duration=entry.get("duration"),
+            file_size=100,
+        )
+        return output_dir / "one.mp4"
+
+    monkeypatch.setattr(cli, "download_media", fake_download)
+    monkeypatch.setattr("builtins.input", lambda prompt: "https://example.com/watch?v=v1")
+    monkeypatch.setattr(sys, "argv", ["downv"])
+    cli._run_download()
+    assert history.count_history() == 1
+    out = capsys.readouterr().out
+    assert "✓ Download completed" in out
+    assert "Playlist complete" not in out
+    assert history.count_history() == 1

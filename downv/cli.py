@@ -378,14 +378,20 @@ def _handle_playlist(info: dict) -> bool:
     return answer in ("y", "yes")
 
 
-def _download_video(info: dict) -> None:
-    """Process a single video through the shared download pipeline."""
+def _download_video(info: dict) -> str:
+    """Process a single video through the shared download pipeline.
+
+    Returns the outcome so playlist orchestration can tally results:
+    ``"downloaded"`` when a new download completed, ``"skipped"`` when
+    duplicate detection found a valid prior download, or ``"failed"`` when
+    the item could not be downloaded for any reason.
+    """
     display_info(info)
 
     qualities = select_formats(info)
     if not qualities:
         print("No video formats available.")
-        return
+        return "failed"
 
     print()
     selected = select_quality(qualities)
@@ -398,7 +404,7 @@ def _download_video(info: dict) -> None:
         print("✗ Could not create output directory.")
         print()
         print(f"Reason: {exc}")
-        return
+        return "failed"
 
     if was_missing:
         print(f"✓ Created output directory: {output_dir}/")
@@ -409,14 +415,14 @@ def _download_video(info: dict) -> None:
     if existing:
         print()
         _print_existing(info)
-        return
+        return "skipped"
 
     if selected.needs_merge and not ffmpeg_available():
         print()
         print("✗ FFmpeg is required to download this quality.")
         print()
         print("Please install FFmpeg and try again.")
-        return
+        return "failed"
 
     print()
     print("Starting download...")
@@ -427,10 +433,11 @@ def _download_video(info: dict) -> None:
         print("✗ Download failed.")
         print()
         print(f"Reason: {exc}")
-        return
+        return "failed"
 
     print()
     print("✓ Download completed")
+    return "downloaded"
 
 
 def _playlist_entry_url(entry: dict) -> str | None:
@@ -461,30 +468,51 @@ def _resolve_playlist_entry(entry) -> dict | None:
         return None
 
 
-def _process_playlist(info: dict) -> None:
+def _print_playlist_summary(stats: dict) -> None:
+    """Print the final playlist summary (Total/Downloaded/Skipped/Failed/Unresolved)."""
+    print()
+    print("Playlist complete")
+    print()
+    print(f"  Total      : {stats['total']}")
+    print(f"  Downloaded : {stats['downloaded']}")
+    print(f"  Skipped    : {stats['skipped']}")
+    print(f"  Failed     : {stats['failed']}")
+    print(f"  Unresolved : {stats['unresolved']}")
+
+
+def _process_playlist(info: dict) -> dict:
     """Download every playlist entry sequentially via the single-video pipeline.
 
     Entries are processed one at a time; malformed or unresolvable entries are
-    reported and skipped without stopping the remaining playlist.
+    reported and skipped without stopping the remaining playlist. A summary is
+    printed once all entries have been iterated. Returns the tally dict.
     """
+    stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
     entries = info.get("entries") or []
     for number, entry in enumerate(entries, start=1):
+        stats["total"] += 1
         print(f"Playlist item {number}")
         entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
         print(f"  Title : {entry_title}")
         resolved = _resolve_playlist_entry(entry)
         if resolved is None:
+            stats["unresolved"] += 1
             print()
             print(f"✗ Could not resolve playlist item {number}.")
             print()
             continue
         print()
         try:
-            _download_video(resolved)
+            outcome = _download_video(resolved)
+            stats[outcome] += 1
         except Exception as exc:
+            stats["failed"] += 1
             print(f"✗ Failed to download playlist item {number}.")
             print()
             print(f"Reason: {exc}")
+
+    _print_playlist_summary(stats)
+    return stats
 
 
 def _run_download() -> None:
