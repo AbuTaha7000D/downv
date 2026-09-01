@@ -381,12 +381,21 @@ def _handle_playlist(info: dict) -> bool:
     return answer in ("y", "yes")
 
 
-def _commit_download(info: dict, selected: SelectedMediaFormat, output_dir: Path) -> str:
+def _commit_download(
+    info: dict,
+    selected: SelectedMediaFormat,
+    output_dir: Path,
+    failed_reason: list | None = None,
+) -> str:
     """Run duplicate detection + FFmpeg check + media download for a resolved
     item using a concrete format and output directory.
 
     Shared by standalone and playlist item downloads. Returns the outcome:
     ``"skipped"`` (already downloaded), ``"failed"``, or ``"downloaded"``.
+
+    When ``failed_reason`` is provided, a concise failure reason is appended to
+    it for each ``"failed"`` outcome so callers can report the reason without
+    capturing stdout. Standalone callers leave it None and are unaffected.
     """
     existing = find_existing_download(info)
     if existing:
@@ -399,6 +408,8 @@ def _commit_download(info: dict, selected: SelectedMediaFormat, output_dir: Path
         print("✗ FFmpeg is required to download this quality.")
         print()
         print("Please install FFmpeg and try again.")
+        if failed_reason is not None:
+            failed_reason.append("FFmpeg is required to download this quality.")
         return "failed"
 
     print()
@@ -410,6 +421,8 @@ def _commit_download(info: dict, selected: SelectedMediaFormat, output_dir: Path
         print("✗ Download failed.")
         print()
         print(f"Reason: {exc}")
+        if failed_reason is not None:
+            failed_reason.append(str(exc).strip() or "Download failed.")
         return "failed"
 
     print()
@@ -421,6 +434,7 @@ def _download_video(
     info: dict,
     selected: SelectedMediaFormat | None = None,
     output_dir: Path | None = None,
+    failed_reason: list | None = None,
 ) -> str:
     """Process a single video through the shared download pipeline.
 
@@ -433,6 +447,9 @@ def _download_video(
     ``"downloaded"`` when a new download completed, ``"skipped"`` when
     duplicate detection found a valid prior download, or ``"failed"`` when
     the item could not be downloaded for any reason.
+
+    When ``failed_reason`` is provided, a concise reason is appended to it on a
+    ``"failed"`` outcome; standalone callers leave it None and are unaffected.
     """
     display_info(info)
 
@@ -440,6 +457,8 @@ def _download_video(
         qualities = select_formats(info)
         if not qualities:
             print("No video formats available.")
+            if failed_reason is not None:
+                failed_reason.append("No video formats available.")
             return "failed"
         print()
         selected = select_quality(qualities)
@@ -453,13 +472,15 @@ def _download_video(
             print("✗ Could not create output directory.")
             print()
             print(f"Reason: {exc}")
+            if failed_reason is not None:
+                failed_reason.append(str(exc).strip() or "Could not create output directory.")
             return "failed"
         if was_missing:
             print(f"✓ Created output directory: {output_dir}/")
         else:
             print(f"✓ Output directory ready: {output_dir}/")
 
-    return _commit_download(info, selected, output_dir)
+    return _commit_download(info, selected, output_dir, failed_reason)
 
 
 def _playlist_entry_url(entry: dict) -> str | None:
@@ -515,7 +536,32 @@ def _print_playlist_summary(stats: dict) -> None:
     print(f"  Unresolved : {stats['unresolved']}")
 
 
+def _print_item_report(header: str, items: list, marker: str) -> None:
+    """Print an item report section (e.g. Failed/Skipped/Unresolved items).
+
+    ``items`` is a list of ``{"title": str, "reason": str}`` dicts in playlist
+    order. The section is only printed when there is at least one item.
+    """
+    if not items:
+        return
+    print()
+    print(header)
+    for item in items:
+        print(f"  {marker} {item['title']}")
+        print(f"    Reason: {item['reason']}")
+
+
 _MAX_PLAYLIST_DIR_NAME = 120
+
+
+def _item_title(resolved, entry) -> str:
+    """Return a usable title for a playlist item, falling back safely."""
+    for source in (resolved, entry):
+        if isinstance(source, dict):
+            title = source.get("title")
+            if isinstance(title, str) and title.strip():
+                return title
+    return "Unknown title"
 
 
 def playlist_dir_name(title: str) -> str:
@@ -636,6 +682,9 @@ def _process_playlist(
     stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
     entries = info.get("entries") or []
     total = _safe_playlist_count(info)
+    failed_items = []
+    skipped_items = []
+    unresolved_items = []
     for number, entry in enumerate(entries, start=1):
         stats["total"] += 1
         denominator = f"/{total}" if total else ""
@@ -653,8 +702,15 @@ def _process_playlist(
             print()
             print(f"✗ Could not resolve playlist item {number}.")
             print()
+            unresolved_items.append(
+                {
+                    "title": _item_title(None, entry),
+                    "reason": "Could not resolve video information.",
+                }
+            )
             continue
         print()
+        failed_reason = []
         try:
             if chosen_height is not None:
                 if item_qualities is None:
@@ -664,18 +720,45 @@ def _process_playlist(
                     stats["failed"] += 1
                     print(f"  Quality {chosen_height}p not available for this item.")
                     print()
+                    failed_items.append(
+                        {"title": _item_title(resolved, entry), "reason": "Selected quality not available."}
+                    )
                     continue
-                outcome = _download_video(resolved, selected=selected, output_dir=playlist_dir)
+                outcome = _download_video(
+                    resolved, selected=selected, output_dir=playlist_dir, failed_reason=failed_reason
+                )
+                if outcome == "failed":
+                    reason = failed_reason[0].strip() if failed_reason else "Download failed."
+                    failed_items.append({"title": _item_title(resolved, entry), "reason": reason})
+                elif outcome == "skipped":
+                    skipped_items.append(
+                        {"title": _item_title(resolved, entry), "reason": "Already downloaded."}
+                    )
+                stats[outcome] += 1
             else:
                 outcome = _download_video(resolved)
-            stats[outcome] += 1
+                if outcome == "failed":
+                    failed_items.append(
+                        {"title": _item_title(resolved, entry), "reason": "Download failed."}
+                    )
+                elif outcome == "skipped":
+                    skipped_items.append(
+                        {"title": _item_title(resolved, entry), "reason": "Already downloaded."}
+                    )
+                stats[outcome] += 1
         except Exception as exc:
             stats["failed"] += 1
             print(f"✗ Failed to download playlist item {number}.")
             print()
             print(f"Reason: {exc}")
+            failed_items.append(
+                {"title": _item_title(resolved, entry), "reason": str(exc).strip() or "Download failed."}
+            )
 
     _print_playlist_summary(stats)
+    _print_item_report("Skipped items:", skipped_items, "-")
+    _print_item_report("Unresolved items:", unresolved_items, "?")
+    _print_item_report("Failed items:", failed_items, "✗")
     return stats
 
 

@@ -1387,3 +1387,474 @@ def test_playlist_item_progress_single_video_unchanged(monkeypatch, tmp_path, ca
     out = capsys.readouterr().out
     assert "Playlist item" not in out
     assert "✓ Download completed" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 / Step 7.2: Playlist failure reporting
+# ---------------------------------------------------------------------------
+
+def _fail_playlist(entries):
+    """Build a playlist info dict from a list of (id, title) tuples."""
+    return _playlist_info(entries=[_resolved(vid, title) for vid, title in entries])
+
+
+def _patch_pipeline(monkeypatch, tmp_path, fail_ids):
+    """Patch the download pipeline so real _download_video runs; blacklist ids fail."""
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    def fake_download(i, sel, out):
+        if i["id"] in fail_ids:
+            raise DownloadFailure("boom")
+        return out / f"{i['id']}.mp4"
+
+    monkeypatch.setattr(cli, "download_media", fake_download)
+
+
+def test_playlist_failure_report_single_failed_item(monkeypatch, tmp_path, capsys):
+    """One failed item is reported under Failed items with its title."""
+    info = _fail_playlist([("v1", "Alpha"), ("v2", "Beta")])
+    _patch_pipeline(monkeypatch, tmp_path, {"v2"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Failed items:" in out
+    assert "✗ Beta" in out
+    assert "Alpha" not in out.split("Failed items:")[1]
+
+
+def test_playlist_failure_report_includes_reason(monkeypatch, tmp_path, capsys):
+    """A failed item includes a concise failure reason."""
+    info = _fail_playlist([("v1", "Alpha")])
+    _patch_pipeline(monkeypatch, tmp_path, {"v1"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Reason: boom" in out
+
+
+def test_playlist_failure_report_multiple_failures(monkeypatch, tmp_path, capsys):
+    """Multiple failures are all reported."""
+    info = _fail_playlist([("v1", "Alpha"), ("v2", "Beta"), ("v3", "Gamma")])
+    _patch_pipeline(monkeypatch, tmp_path, {"v1", "v3"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    section = out.split("Failed items:")[1]
+    assert "✗ Alpha" in section
+    assert "✗ Beta" not in section
+    assert "✗ Gamma" in section
+
+
+def test_playlist_failure_report_ordering(monkeypatch, tmp_path, capsys):
+    """Failures are reported in playlist processing order."""
+    info = _fail_playlist([("v1", "Alpha"), ("v2", "Beta"), ("v3", "Gamma")])
+    _patch_pipeline(monkeypatch, tmp_path, {"v3", "v1"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    section = out.split("Failed items:")[1]
+    assert section.index("✗ Alpha") < section.index("✗ Gamma")
+
+
+def test_playlist_failure_report_unresolved_not_failed(monkeypatch, tmp_path, capsys):
+    """An unresolved item must not appear under Failed items."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), None, _resolved("v2", "Beta")])
+    _patch_pipeline(monkeypatch, tmp_path, set())
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Failed items:" not in out
+    assert "Unresolved : 1" in out
+
+
+def test_playlist_failure_report_skipped_not_failed(monkeypatch, tmp_path, capsys, data_dir):
+    """A skipped (already downloaded) item must not appear under Failed items."""
+    info = _fail_playlist([("v1", "Alpha"), ("v2", "Beta")])
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    match = {"v1": {"video_id": "v1", "title": "Alpha", "filename": "v1.mp4"}}
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: match.get(i["id"]))
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    recorded = []
+    monkeypatch.setattr(cli, "download_media", lambda i, s, o: recorded.append(i["id"]))
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert recorded == ["v2"]
+    assert "Skipped    : 1" in out
+    assert "Failed items:" not in out
+
+
+def test_playlist_failure_report_success_not_failed(monkeypatch, tmp_path, capsys):
+    """A successful item must not appear under Failed items."""
+    info = _fail_playlist([("v1", "Alpha"), ("v2", "Beta")])
+    _patch_pipeline(monkeypatch, tmp_path, set())
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Downloaded : 2" in out
+    assert "Failed items:" not in out
+
+
+def test_playlist_failure_report_missing_title(monkeypatch, tmp_path, capsys):
+    """A failed item with no usable title falls back to 'Unknown title' without crashing."""
+    untitled = {"id": "v1", "webpage_url": "u1", "url": "u1",
+                "formats": [{"format_id": "0", "height": 480}]}
+    info = _playlist_info(entries=[untitled, _resolved("v2", "Beta")])
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i, s, o: (_ for _ in ()).throw(DownloadFailure("x")))
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Failed items:" in out
+    assert "Unknown title" in out.split("Failed items:")[1]
+
+
+def test_playlist_failure_report_counts_correct(monkeypatch, tmp_path, capsys):
+    """Summary counts remain correct alongside the failure report."""
+    info = _fail_playlist([("v1", "Alpha"), ("v2", "Beta"), ("v3", "Gamma")])
+    _patch_pipeline(monkeypatch, tmp_path, {"v2"})
+    stats = cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    assert stats["total"] == 3
+    assert stats["downloaded"] == 2
+    assert stats["failed"] == 1
+    assert stats["unresolved"] == 0
+    assert stats["total"] == stats["downloaded"] + stats["skipped"] + stats["failed"] + stats["unresolved"]
+
+
+def test_playlist_failure_report_invariant(monkeypatch, tmp_path, capsys):
+    """The Total == Downloaded + Skipped + Failed + Unresolved invariant holds with failures."""
+    info = _playlist_info(entries=[_resolved("v1", "A"), None, _resolved("v2", "B")])
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i, s, o: (_ for _ in ()).throw(DownloadFailure("boom")))
+    stats = _summary(cli._process_playlist(info))
+    assert stats["total"] == stats["downloaded"] + stats["skipped"] + stats["failed"] + stats["unresolved"]
+
+
+def test_playlist_failure_report_single_video_unchanged(monkeypatch, tmp_path, capsys):
+    """Single-video download output is unchanged and never prints Failed items."""
+    info = {"id": "v1", "title": "One", "formats": [{"format_id": "0", "height": 480}]}
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i, s, o: o / "x.mp4")
+    cli._download_video(info)
+    out = capsys.readouterr().out
+    assert "Failed items:" not in out
+    assert "✓ Download completed" in out
+
+
+def test_playlist_failure_report_lazy_safe(monkeypatch, tmp_path, capsys):
+    """Lazy playlist processing stays safe and the generator runs exactly once."""
+    produced = []
+
+    def gen():
+        for i in range(3):
+            produced.append(i)
+            yield _resolved(f"v{i}", f"Title {i}")
+
+    info = {"_type": "playlist", "title": "Lazy", "entries": gen()}
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i_, s, o: o)
+    stats = cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    assert produced == [0, 1, 2]
+    assert stats["total"] == 3
+    assert stats["downloaded"] == 3
+
+
+def test_playlist_failure_report_quality_unavailable(monkeypatch, tmp_path, capsys):
+    """A quality-unavailable item is Failed with a concise reason, not unresolved."""
+
+    def fake_select(i):
+        if i["id"] == "v1":
+            return {720: _selected()}
+        return {480: _selected()}
+
+    monkeypatch.setattr(cli, "select_formats", fake_select)
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i, s, o: o / "x.mp4")
+
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta")])
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Failed     : 1" in out
+    assert "Failed items:" in out
+    assert "Selected quality not available." in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 / Step 7.3: Skipped & Unresolved reporting
+# ---------------------------------------------------------------------------
+
+def _patch_pipeline_skips(monkeypatch, tmp_path, skip_ids):
+    """Patch pipeline so real _download_video runs; ids in skip_ids are duplicates."""
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: {"dup": True} if i["id"] in skip_ids else None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i, sel, out: out / f"{i['id']}.mp4")
+
+
+def test_playlist_skipped_report_single_title(monkeypatch, tmp_path, capsys):
+    """One skipped item is reported under Skipped items with its title."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta")])
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v2"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Skipped items:" in out
+    assert "  - Beta" in out
+    assert "Alpha" not in out.split("Skipped items:")[1]
+
+
+def test_playlist_skipped_report_reason(monkeypatch, tmp_path, capsys):
+    """The skipped reason is displayed."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha")])
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v1"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Reason: Already downloaded." in out
+
+
+def test_playlist_skipped_report_multiple(monkeypatch, tmp_path, capsys):
+    """Multiple skipped items are reported."""
+    info = _playlist_info(
+        entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta"), _resolved("v3", "Gamma")]
+    )
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v1", "v3"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    section = out.split("Skipped items:")[1]
+    assert "  - Alpha" in section
+    assert "  - Beta" not in section
+    assert "  - Gamma" in section
+
+
+def test_playlist_skipped_report_ordering(monkeypatch, tmp_path, capsys):
+    """Skipped items follow playlist order."""
+    info = _playlist_info(
+        entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta"), _resolved("v3", "Gamma")]
+    )
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v3", "v1"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    section = out.split("Skipped items:")[1]
+    assert section.index("- Alpha") < section.index("- Gamma")
+
+
+def test_playlist_unresolved_report_title(monkeypatch, tmp_path, capsys):
+    """One unresolved item is reported under Unresolved items."""
+    info = _playlist_info(entries=[None])
+    monkeypatch.setattr(cli, "_download_video", lambda entry: pytest.fail("must not download"))
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Unresolved items:" in out
+    assert "  ? Unknown title" in out
+
+
+def test_playlist_unresolved_report_reason(monkeypatch, tmp_path, capsys):
+    """The unresolved reason is displayed."""
+    info = _playlist_info(entries=[None])
+    monkeypatch.setattr(cli, "_download_video", lambda entry: pytest.fail("must not download"))
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Reason: Could not resolve video information." in out
+
+
+def test_playlist_unresolved_report_multiple(monkeypatch, tmp_path, capsys):
+    """Multiple unresolved items are reported."""
+    info = _playlist_info(entries=[None, None])
+    monkeypatch.setattr(cli, "_download_video", lambda entry: pytest.fail("must not download"))
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    section = out.split("Unresolved items:")[1]
+    assert section.count("? Unknown title") == 2
+    assert "Unresolved : 2" in out
+
+
+def test_playlist_unresolved_report_ordering(monkeypatch, tmp_path, capsys):
+    """Unresolved items follow playlist order (titles preserved when available)."""
+    info = _playlist_info(entries=[{"title": "First"}, {"title": "Second"}])
+    monkeypatch.setattr(cli, "_download_video", lambda entry: pytest.fail("must not download"))
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    section = out.split("Unresolved items:")[1]
+    assert section.index("? First") < section.index("? Second")
+
+
+def test_playlist_skipped_not_in_failed(monkeypatch, tmp_path, capsys):
+    """Skipped items are not included in the Failed report."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta")])
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v1"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Failed items:" not in out
+
+
+def test_playlist_unresolved_not_in_failed(monkeypatch, tmp_path, capsys):
+    """Unresolved items are not included in the Failed report."""
+    info = _playlist_info(entries=[None, _resolved("v2", "Beta")])
+    _patch_pipeline(monkeypatch, tmp_path, set())
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Failed items:" not in out
+    assert "Unresolved : 1" in out
+
+
+def test_playlist_mixed_categories_reported_separately(monkeypatch, tmp_path, capsys):
+    """A mixed playlist reports Downloaded/Skipped/Failed/Unresolved separately."""
+    info = _playlist_info(
+        entries=[
+            _resolved("v1", "Alpha"),  # downloaded
+            _resolved("v2", "Beta"),   # skipped
+            _resolved("v3", "Gamma"),  # failed
+            None,                      # unresolved
+            _resolved("v5", "Epsilon"),  # downloaded
+        ]
+    )
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: {"dup": 1} if i["id"] == "v2" else None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    def fake_download(i, sel, out):
+        if i["id"] == "v3":
+            raise DownloadFailure("boom")
+        return out / f"{i['id']}.mp4"
+
+    monkeypatch.setattr(cli, "download_media", fake_download)
+    stats = cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    assert stats == {"total": 5, "downloaded": 2, "skipped": 1, "failed": 1, "unresolved": 1}
+    out = capsys.readouterr().out
+    assert "Skipped items:" in out and "  - Beta" in out
+    assert "Unresolved items:" in out
+    assert "Failed items:" in out and "  ✗ Gamma" in out
+
+
+def test_playlist_unresolved_missing_title_fallback(monkeypatch, tmp_path, capsys):
+    """Missing title uses the safe fallback for unresolved items."""
+    info = {"_type": "playlist", "title": "P", "entries": ["bad"]}
+    monkeypatch.setattr(cli, "_download_video", lambda entry: pytest.fail("must not download"))
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Unknown title" in out.split("Unresolved items:")[1]
+
+
+def test_playlist_skipped_missing_title_fallback(monkeypatch, tmp_path, capsys):
+    """A skipped item with no usable title falls back to 'Unknown title'."""
+    untitled = {"id": "v1", "webpage_url": "u1", "url": "u1",
+                "formats": [{"format_id": "0", "height": 480}]}
+    info = _playlist_info(entries=[untitled])
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v1"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Unknown title" in out.split("Skipped items:")[1]
+
+
+def test_playlist_skipped_summary_counts(monkeypatch, tmp_path, capsys):
+    """Summary counts remain unchanged with skipped items."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta")])
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v1"})
+    stats = cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    assert stats["total"] == 2
+    assert stats["downloaded"] == 1
+    assert stats["skipped"] == 1
+    assert stats["failed"] == 0
+    assert stats["unresolved"] == 0
+
+
+def test_playlist_skipped_unresolved_invariant(monkeypatch, tmp_path, capsys):
+    """The summary invariant holds with skipped and unresolved items."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), None, _resolved("v2", "Beta")])
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v1"})
+    stats = _summary(cli._process_playlist(info))
+    assert stats["total"] == stats["downloaded"] + stats["skipped"] + stats["failed"] + stats["unresolved"]
+
+
+def test_playlist_no_skipped_or_unresolved_no_sections(monkeypatch, tmp_path, capsys):
+    """A playlist with no skipped/unresolved items does not print those sections."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta")])
+    _patch_pipeline(monkeypatch, tmp_path, set())
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Skipped items:" not in out
+    assert "Unresolved items:" not in out
+    assert "Failed items:" not in out
+
+
+def test_playlist_skipped_all_skipped(monkeypatch, tmp_path, capsys):
+    """A playlist with only skipped items reports them all."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta")])
+    _patch_pipeline_skips(monkeypatch, tmp_path, {"v1", "v2"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Skipped    : 2" in out
+    assert "Downloaded : 0" in out
+    assert out.split("Skipped items:")[1].count("- ") == 2
+
+
+def test_playlist_step72_failed_report_still_works(monkeypatch, tmp_path, capsys):
+    """Step 7.2 failed-item reporting remains intact alongside new sections."""
+    info = _playlist_info(entries=[_resolved("v1", "Alpha"), _resolved("v2", "Beta")])
+    _patch_pipeline(monkeypatch, tmp_path, {"v2"})
+    cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Failed     : 1" in out
+    assert "Failed items:" in out
+    assert "  ✗ Beta" in out
+    assert "Reason: boom" in out
+
+
+def test_playlist_report_single_video_unchanged(monkeypatch, tmp_path, capsys):
+    """Standalone single-video download does not print any report sections."""
+    info = {"id": "v1", "title": "One", "formats": [{"format_id": "0", "height": 480}]}
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i, s, o: o / "x.mp4")
+    cli._download_video(info)
+    out = capsys.readouterr().out
+    assert "Skipped items:" not in out
+    assert "Unresolved items:" not in out
+    assert "Failed items:" not in out
+    assert "✓ Download completed" in out
+
+
+def test_playlist_report_lazy_safe(monkeypatch, tmp_path, capsys):
+    """Lazy playlist processing remains intact with the new report sections."""
+    produced = []
+
+    def gen():
+        for i in range(3):
+            produced.append(i)
+            yield _resolved(f"v{i}", f"Title {i}")
+
+    info = {"_type": "playlist", "title": "Lazy", "entries": gen()}
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda i_, s, o: o)
+    stats = cli._process_playlist(info, chosen_height=480, playlist_dir=tmp_path)
+    assert produced == [0, 1, 2]
+    assert stats["total"] == 3
+    assert stats["downloaded"] == 3
+    assert "Skipped items:" not in capsys.readouterr().out
