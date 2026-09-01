@@ -317,6 +317,67 @@ def show_history() -> None:
     print(f"Total: {len(records)}")
 
 
+def _safe_playlist_count(info: dict):
+    """Best-effort count of a playlist's entries without forcing resolution.
+
+    Prefers the authoritative ``playlist_count`` field, which yt-dlp reports
+    without resolving every entry. Falls back to ``len(entries)`` only when
+    ``entries`` is a concrete, sized sequence. Returns None when the count
+    cannot be determined safely (e.g. ``entries`` is a lazy iterator).
+    """
+    count = info.get("playlist_count")
+    if isinstance(count, int) and count >= 0:
+        return count
+    entries = info.get("entries")
+    if entries is not None:
+        try:
+            return len(entries)
+        except (TypeError, AttributeError):
+            return None
+    return None
+
+
+def _describe_playlist(info: dict) -> tuple:
+    """Return (title, uploader, count) for a playlist, tolerating missing data."""
+    title = (
+        info.get("title")
+        or info.get("playlist_title")
+        or info.get("id")
+        or "Untitled playlist"
+    )
+    uploader = (
+        info.get("uploader")
+        or info.get("channel")
+        or info.get("playlist_uploader")
+        or "Unknown"
+    )
+    count = _safe_playlist_count(info)
+    return title, uploader, count
+
+
+def _handle_playlist(info: dict) -> bool:
+    """Display playlist metadata and ask for confirmation.
+
+    Returns True if the user confirmed downloading, False otherwise. No media
+    is downloaded here; this only stages the decision for a later step.
+    """
+    title, uploader, count = _describe_playlist(info)
+
+    print("Playlist detected")
+    print()
+    print(f"  Title    : {title}")
+    print(f"  Uploader : {uploader}")
+    if count is not None:
+        print(f"  Videos   : {count}")
+        prompt = f"\nDownload all {count} videos? [y/N]: "
+    else:
+        print("  Videos   : ?")
+        prompt = "\nDownload all videos? [y/N]: "
+
+    answer = input(prompt).strip().lower()
+    return answer in ("y", "yes")
+
+
 def _run_download() -> None:
     print("DownV - Media Downloader")
     print()
@@ -333,12 +394,12 @@ def _run_download() -> None:
         return
 
     if "entries" in info:
-        print("Playlist detected.")
-        print()
-        playlist_length = len(info.get("entries") or [])
-        print(f"Title    : {info.get('title', 'Unknown')}")
-        print(f"Uploader : {info.get('uploader') or info.get('channel') or 'Unknown'}")
-        print(f"Items    : {playlist_length}")
+        if _handle_playlist(info):
+            print()
+            print("✓ Playlist confirmed")
+        else:
+            print()
+            print("Download cancelled.")
         return
 
     display_info(info)

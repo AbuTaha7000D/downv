@@ -33,4 +33,4 @@ python -m downv
 
 ## License
 
-MIT
+[MIT](LICENSE)
