@@ -617,3 +617,238 @@ def test_playlist_summary_single_video_unaffected(monkeypatch, tmp_path, data_di
     assert "✓ Download completed" in out
     assert "Playlist complete" not in out
     assert history.count_history() == 1
+
+
+def _pipeline_patches(monkeypatch, tmp_path):
+    """Hook selection/download so the real `_download_video` runs end to end.
+
+    ``download_media`` is replaced with a stub that writes a real file and
+    records history (mirroring the real ``_record``), so the real
+    ``find_existing_download`` duplicate detection works against the file.
+    """
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    def fake_download(entry, selected, output_dir):
+        fname = f"{entry['id']}.mp4"
+        target = output_dir / fname
+        target.write_bytes(b"data")
+        history.record_download(
+            video_id=entry["id"],
+            title=entry["title"],
+            url=entry["webpage_url"],
+            filename=fname,
+            filepath=str(target),
+            quality=selected.height,
+            duration=entry.get("duration"),
+            file_size=target.stat().st_size,
+        )
+        return target
+
+    monkeypatch.setattr(cli, "download_media", fake_download)
+
+
+def test_playlist_success_creates_exactly_one_history_record(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_resolved("v1", "One")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 1, "downloaded": 1, "skipped": 0, "failed": 0, "unresolved": 0}
+    assert history.count_history() == 1
+    record = history.find_download("v1")
+    assert record is not None
+    assert record["title"] == "One"
+    assert record["video_id"] == "v1"
+
+
+def test_playlist_multiple_success_creates_one_record_per_video(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 3, "downloaded": 3, "skipped": 0, "failed": 0, "unresolved": 0}
+    assert history.count_history() == 3
+    for vid in ("v1", "v2", "v3"):
+        assert history.find_download(vid) is not None
+
+
+def test_playlist_already_downloaded_item_is_skipped(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    # v1 already has a valid, recorded download on disk.
+    target = tmp_path / "v1.mp4"
+    target.write_bytes(b"data")
+    history.record_download(
+        video_id="v1",
+        title="One",
+        url="https://example.com/watch?v=v1",
+        filename="v1.mp4",
+        filepath=str(target),
+        quality=480,
+        duration=60,
+        file_size=target.stat().st_size,
+    )
+
+    downloads_called = []
+
+    def counting_download(entry, selected, output_dir):
+        downloads_called.append(entry["id"])
+        return _pipeline_downloaded(entry, selected, output_dir)
+
+    monkeypatch.setattr(cli, "download_media", counting_download)
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 2, "downloaded": 1, "skipped": 1, "failed": 0, "unresolved": 0}
+    assert downloads_called == ["v2"]
+    assert "✓ Video already downloaded" in capsys.readouterr().out
+
+
+def _pipeline_downloaded(entry, selected, output_dir):
+    fname = f"{entry['id']}.mp4"
+    target = output_dir / fname
+    target.write_bytes(b"data")
+    history.record_download(
+        video_id=entry["id"],
+        title=entry["title"],
+        url=entry["webpage_url"],
+        filename=fname,
+        filepath=str(target),
+        quality=selected.height,
+        duration=entry.get("duration"),
+        file_size=target.stat().st_size,
+    )
+    return target
+
+
+def test_playlist_skipped_does_not_create_new_history_record(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    target = tmp_path / "v1.mp4"
+    target.write_bytes(b"data")
+    history.record_download(
+        video_id="v1",
+        title="One",
+        url="https://example.com/watch?v=v1",
+        filename="v1.mp4",
+        filepath=str(target),
+        quality=480,
+        duration=60,
+        file_size=target.stat().st_size,
+    )
+    before = len(history.find_downloads("v1"))  # 1 existing record for v1
+    _summary(cli._process_playlist(info))
+    assert history.count_history() == 2  # v1 (unchanged) + newly downloaded v2
+    assert len(history.find_downloads("v1")) == before
+    assert "✓ Video already downloaded" in capsys.readouterr().out
+
+
+def test_playlist_skipped_does_not_modify_existing_history_record(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    target = tmp_path / "v1.mp4"
+    target.write_bytes(b"data")
+    history.record_download(
+        video_id="v1",
+        title="Original",
+        url="https://example.com/watch?v=v1",
+        filename="v1.mp4",
+        filepath=str(target),
+        quality=480,
+        duration=60,
+        file_size=target.stat().st_size,
+    )
+    original = history.find_download("v1")
+    _summary(cli._process_playlist(info))
+    after = history.find_download("v1")
+    assert after == original
+    assert after["title"] == "Original"
+    assert target.read_bytes() == b"data"
+
+
+def test_playlist_duplicate_video_creates_no_duplicate_history(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v1", "One")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 2, "downloaded": 1, "skipped": 1, "failed": 0, "unresolved": 0}
+    incoming = [r for r in history.get_download_history() if r["video_id"] == "v1"]
+    assert len(incoming) == 1
+
+
+def test_playlist_failed_creates_no_success_history_record(monkeypatch, tmp_path, data_dir, capsys):
+    def failing_download(entry, selected, output_dir):
+        raise DownloadFailure("boom")
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "download_media", failing_download)
+    info = _playlist_info(entries=[_resolved("v1", "One")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 1, "downloaded": 0, "skipped": 0, "failed": 1, "unresolved": 0}
+    assert history.count_history() == 0
+
+
+def test_playlist_unresolved_creates_no_history_record(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_partial("u1", "Unresolved"), _resolved("v1", "One")])
+
+    def fake_resolve(entry):
+        if entry.get("id") == "u1":
+            return None
+        return entry
+
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 2, "downloaded": 1, "skipped": 0, "failed": 0, "unresolved": 1}
+    assert history.find_download("u1") is None
+    assert history.count_history() == 1
+
+
+def test_playlist_continues_after_skipped_and_failed(monkeypatch, tmp_path, data_dir, capsys):
+    def flaky_download(entry, selected, output_dir):
+        if entry["id"] == "v2":
+            raise DownloadFailure("boom")
+        return _pipeline_downloaded(entry, selected, output_dir)
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "download_media", flaky_download)
+    info = _playlist_info(
+        entries=[_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")]
+    )
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 3, "downloaded": 2, "skipped": 0, "failed": 1, "unresolved": 0}
+    assert history.count_history() == 2
+    assert history.find_download("v1") is not None
+    assert history.find_download("v2") is None
+    assert history.find_download("v3") is not None
+
+
+def test_playlist_no_playlist_level_history_record(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    _summary(cli._process_playlist(info))
+    assert history.count_history() == 2
+    for record in history.get_download_history():
+        assert record["title"] != "My Playlist"
+
+
+def test_playlist_legacy_existing_record_skipped(monkeypatch, tmp_path, data_dir, capsys):
+    _pipeline_patches(monkeypatch, tmp_path)
+    target = tmp_path / "legacy.mp4"
+    target.write_bytes(b"data")
+    history.record_download(
+        video_id="v1",
+        title="Legacy",
+        url="https://example.com/watch?v=v1",
+        filename="legacy.mp4",
+        filepath=str(target),
+        quality=480,
+        duration=60,
+        file_size=target.stat().st_size,
+    )
+    info = _playlist_info(entries=[_resolved("v1", "One")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 1, "downloaded": 0, "skipped": 1, "failed": 0, "unresolved": 0}
+    assert history.count_history() == 1
+    assert history.find_download("v1")["title"] == "Legacy"
