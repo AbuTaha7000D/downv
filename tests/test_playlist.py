@@ -1256,3 +1256,134 @@ def test_run_download_playlist_rerun_detects_already_downloaded(monkeypatch, tmp
     assert "Playlist complete" in out
     assert "Downloaded : 0" in out
     assert "Skipped    : 1" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 / Step 7.1: Playlist per-item progress indication
+# ---------------------------------------------------------------------------
+
+def test_playlist_item_progress_known_count(monkeypatch, capsys):
+    """A known playlist count displays ``Playlist item N/total``."""
+    info = _playlist_info(
+        entries=[_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")],
+    )
+    monkeypatch.setattr(cli, "_download_video", lambda entry: "downloaded")
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Playlist item 1/3" in out
+    assert "Playlist item 2/3" in out
+    assert "Playlist item 3/3" in out
+
+
+def test_playlist_item_progress_explicit_playlist_count(monkeypatch, capsys):
+    """A ``playlist_count`` field is preferred over ``len(entries)`` when present."""
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    info["playlist_count"] = 5
+    monkeypatch.setattr(cli, "_download_video", lambda entry: "downloaded")
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Playlist item 1/5" in out
+    assert "Playlist item 2/5" in out
+
+
+def test_playlist_item_progress_unknown_count(monkeypatch, capsys):
+    """An unknown count must not fabricate a denominator."""
+    class _Lazy:
+        def __iter__(self):
+            return iter([_resolved("v1", "One"), _resolved("v2", "Two")])
+
+    info = {"_type": "playlist", "title": "Lazy", "entries": _Lazy()}
+    monkeypatch.setattr(cli, "_download_video", lambda entry: "downloaded")
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Playlist item 1" in out
+    assert "Playlist item 2" in out
+    assert "Playlist item 1/" not in out and "Playlist item 2/" not in out
+
+
+def test_playlist_item_progress_empty_playlist(monkeypatch, capsys):
+    """An empty playlist still reports cleanly with no item lines."""
+    info = _playlist_info(title="Empty List", entries=[])
+    monkeypatch.setattr(cli, "_download_video", lambda entry: "downloaded")
+    stats = cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert stats["total"] == 0
+    assert "Playlist item" not in out
+    assert "Playlist complete" in out
+
+
+def test_playlist_item_progress_advances_across_failures(monkeypatch, capsys):
+    """Failed and unresolved items still advance the displayed item counter."""
+    info = _playlist_info(
+        entries=[_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")],
+    )
+
+    def fake_download(entry, selected, output_dir):
+        if entry["id"] == "v2":
+            raise DownloadFailure("boom")
+        return output_dir / f"{entry['id']}.mp4"
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "download_media", fake_download)
+
+    def fake_resolve(entry):
+        if not isinstance(entry, dict) or entry["id"] == "v3":
+            return None
+        return entry
+
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    cli._process_playlist(info)
+    out = capsys.readouterr().out
+    assert "Playlist item 1/3" in out
+    assert "Playlist item 2/3" in out
+    assert "Playlist item 3/3" in out
+
+
+def test_playlist_item_progress_lazy_once(monkeypatch, capsys):
+    """A lazy generator is processed exactly once and shows no fabricated total."""
+    produced = []
+
+    def gen():
+        for i in range(3):
+            produced.append(i)
+            yield _resolved(f"v{i}", f"Title {i}")
+
+    info = {"_type": "playlist", "title": "Lazy", "entries": gen()}
+    calls = []
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry["id"]) or "downloaded")
+    stats = cli._process_playlist(info)
+    assert produced == [0, 1, 2]
+    assert calls == ["v0", "v1", "v2"]
+    assert stats["total"] == 3
+    out = capsys.readouterr().out
+    assert "Playlist item 1/" not in out
+
+
+def test_playlist_item_progress_summary_unchanged(monkeypatch, capsys):
+    """The summary invariant still holds with progress denominated output."""
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    calls = []
+    monkeypatch.setattr(cli, "_download_video", lambda entry: calls.append(entry["id"]) or "downloaded")
+    stats = cli._process_playlist(info)
+    assert stats["total"] == stats["downloaded"] + stats["skipped"] + stats["failed"] + stats["unresolved"]
+    out = capsys.readouterr().out
+    assert "Playlist complete" in out
+    assert "Total      : 2" in out
+    assert "Downloaded : 2" in out
+
+
+def test_playlist_item_progress_single_video_unchanged(monkeypatch, tmp_path, capsys):
+    """Standalone single-video download output is not prefixed with any item line."""
+    info = {"id": "v1", "title": "One", "formats": [{"format_id": "0", "height": 480}]}
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda info_, sel, out: out / "x.mp4")
+    cli._download_video(info)
+    out = capsys.readouterr().out
+    assert "Playlist item" not in out
+    assert "✓ Download completed" in out

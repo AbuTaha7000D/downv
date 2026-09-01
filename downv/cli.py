@@ -635,9 +635,11 @@ def _process_playlist(
     """
     stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
     entries = info.get("entries") or []
+    total = _safe_playlist_count(info)
     for number, entry in enumerate(entries, start=1):
         stats["total"] += 1
-        print(f"Playlist item {number}")
+        denominator = f"/{total}" if total else ""
+        print(f"Playlist item {number}{denominator}")
         entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
         print(f"  Title : {entry_title}")
         if per_item is not None:
