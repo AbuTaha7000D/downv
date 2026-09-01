@@ -846,9 +846,16 @@ def _report_playlist_complete(stats: dict, failed: list, skipped: list, unresolv
 
 
 def _print_retry_summary(stats: dict) -> None:
-    """Print the summary shown after a retry run of a playlist subset."""
+    """Print the summary shown after a retry run of a playlist subset.
+
+    The counts deliberately describe only the current retry round, not the whole
+    playlist, so the scope is stated in a subheading to avoid misreading them as
+    the overall playlist totals.
+    """
     print()
     print("Retry complete")
+    print()
+    print("  Retry round totals")
     print()
     print(f"  Retried     : {stats['total']}")
     print(f"  Downloaded  : {stats['downloaded']}")
@@ -887,6 +894,7 @@ def _run_with_retries(
             for p in pending
         ]
         print()
+        print("Retrying failed/unresolved items...")
         stats, failed, skipped, unresolved = _process_items(
             retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items)
         )
