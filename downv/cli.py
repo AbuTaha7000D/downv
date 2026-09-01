@@ -25,9 +25,52 @@ from downv.formats import (
 from downv.paths import OutputDirectoryError, get_output_directory
 
 
-def prompt_for_url() -> str:
+class _MenuCancelled(Exception):
+    """Raised when an interactive menu is cancelled (EOF / non-TTY stdin).
+
+    Distinguishes an explicit user-cancelled quality choice from the normal
+    ``None`` that simply means "no menu was displayed".
+    """
+
+
+def _read_line(prompt: str) -> str | None:
+    """Read one line of input, returning the raw (untrimmed) string.
+
+    Returns ``None`` when stdin is exhausted (EOF) so callers can terminate
+    cleanly instead of looping forever or crashing with an ``EOFError``.
+    """
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+
+
+def _menu_cancelled() -> None:
+    print()
+    print("Download cancelled.")
+
+
+def _clear_menu(rendered_lines: int) -> None:
+    """Erase the lines last drawn by the quality menu so cancellation leaves the
+    terminal clean instead of a dangling menu."""
+    if rendered_lines <= 0:
+        return
+    moves = rendered_lines - 1
+    sys.stdout.write(f"\033[{moves}A")
+    for i in range(rendered_lines):
+        sys.stdout.write("\033[2K")
+        if i < rendered_lines - 1:
+            sys.stdout.write("\n")
+    sys.stdout.write(f"\033[{moves}A")
+    sys.stdout.flush()
+
+
+def prompt_for_url() -> str | None:
     while True:
-        url = input("Enter URL: ").strip()
+        line = _read_line("Enter URL: ")
+        if line is None:
+            return None
+        url = line.strip()
         if url:
             return url
         print()
@@ -65,11 +108,24 @@ def display_info(info: dict) -> None:
 
 
 def read_key() -> str:
+    """Read a single key from a raw terminal, or ``"EOF"`` when unavailable.
+
+    ``"EOF"`` is returned when:
+      * stdin is not an interactive terminal (raw mode cannot be entered), or
+      * the underlying read returns no data (end of stream).
+
+    This keeps the quality menu from calling ``termios``/``tty`` on a non-TTY
+    and from looping forever when the stream is exhausted.
+    """
+    if not sys.stdin.isatty():
+        return "EOF"
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
         ch = sys.stdin.read(1)
+        if not ch:
+            return "EOF"
         if ch == "\x1b":
             seq = sys.stdin.read(2)
             if seq == "[A":
@@ -88,7 +144,7 @@ def read_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def select_quality(qualities: Dict[int, SelectedMediaFormat]) -> SelectedMediaFormat:
+def select_quality(qualities: Dict[int, SelectedMediaFormat]) -> SelectedMediaFormat | None:
     items = list(qualities.items())
     index = 0
     rendered_lines = 0
@@ -117,6 +173,9 @@ def select_quality(qualities: Dict[int, SelectedMediaFormat]) -> SelectedMediaFo
     while True:
         render()
         key = read_key()
+        if key in ("EOF", ""):
+            _clear_menu(rendered_lines)
+            return None
         if key == "UP":
             index = (index - 1) % len(items)
         elif key == "DOWN":
@@ -377,8 +436,10 @@ def _handle_playlist(info: dict) -> bool:
         print("  Videos   : ?")
         prompt = "\nDownload all videos? [y/N]: "
 
-    answer = input(prompt).strip().lower()
-    return answer in ("y", "yes")
+    answer = _read_line(prompt)
+    if answer is None:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def _commit_download(
@@ -462,6 +523,11 @@ def _download_video(
             return "failed"
         print()
         selected = select_quality(qualities)
+        if selected is None:
+            _menu_cancelled()
+            if failed_reason is not None:
+                failed_reason.append("Download cancelled.")
+            return "failed"
 
     if output_dir is None:
         output_dir = Path.home() / "Videos" / "downv"
@@ -637,6 +703,8 @@ def _choose_playlist_quality(per_item: list) -> int | None:
     print()
     print("Playlist quality")
     selected = select_quality(menu)
+    if selected is None:
+        raise _MenuCancelled
     return selected.height
 
 
@@ -886,8 +954,8 @@ def _run_with_retries(
     _report_playlist_complete(stats, failed, skipped, unresolved)
     while failed or unresolved:
         pending = sorted(failed + unresolved, key=lambda d: d["index"])
-        answer = input("\nRetry failed/unresolved items? [y/N]: ").strip().lower()
-        if answer not in ("y", "yes"):
+        answer = _read_line("\nRetry failed/unresolved items? [y/N]: ")
+        if answer is None or answer.strip().lower() not in ("y", "yes"):
             break
         retry_items = [
             {"index": p["index"], "entry": p["entry"], "resolved": p["resolved"], "qualities": p["qualities"]}
@@ -932,6 +1000,9 @@ def _run_download() -> None:
     print("DownV - Media Downloader")
     print()
     url = prompt_for_url()
+    if url is None:
+        _menu_cancelled()
+        return
     print()
     print("Fetching media information...")
 
@@ -949,7 +1020,12 @@ def _run_download() -> None:
             print("✓ Playlist confirmed")
             print()
             title = info.get("title") or info.get("playlist_title") or info.get("id") or "Playlist"
-            chosen_height, per_item = _plan_playlist(info)
+            try:
+                chosen_height, per_item = _plan_playlist(info)
+            except _MenuCancelled:
+                print()
+                print("Download cancelled.")
+                return
             try:
                 playlist_dir = _playlist_output_dir(title)
             except OutputDirectoryError as exc:
