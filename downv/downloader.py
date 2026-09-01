@@ -1,0 +1,176 @@
+"""Video download engine using yt-dlp."""
+
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yt_dlp
+from yt_dlp.utils import DownloadError, sanitize_filename
+
+from downv import history
+from downv.formats import SelectedMediaFormat
+
+
+class DownloadFailure(Exception):
+    """Raised when a download cannot be completed."""
+
+
+def ffmpeg_available() -> bool:
+    """Return True if FFmpeg is available on the system PATH."""
+    return shutil.which("ffmpeg") is not None
+
+
+def _media_for_base(output_dir: Path, base: str) -> Path:
+    """Return the media file in ``output_dir`` whose base name is ``base``.
+
+    The base name is the title-derived stem; the extension is whatever yt-dlp
+    produced (mp4, mkv, webm, ...). Sidecar and fragment files are ignored.
+    """
+    if not output_dir.is_dir():
+        return None
+    for child in output_dir.iterdir():
+        if child.is_file() and child.name.startswith(base + "."):
+            if child.name.endswith(".info.json") or child.name.endswith(".part"):
+                continue
+            return child
+    return None
+
+
+def _valid_media_state(record: dict, path: Path) -> bool:
+    """Return True if ``path`` still represents the recorded download.
+
+    Uses filesystem metadata only (no hashing): the file's size must match the
+    recorded ``file_size`` and its mtime must not be newer than the recorded
+    ``downloaded_at`` timestamp. Records without the ``file_size`` field
+    (pre-dating Step 5B.3) are not trusted and are treated as invalid so they
+    can never cause a false "already downloaded" result.
+    """
+    file_size = record.get("file_size")
+    downloaded_at = record.get("downloaded_at")
+    if file_size is None or not downloaded_at:
+        return False
+    try:
+        recorded_epoch = datetime.fromisoformat(downloaded_at)
+        size = path.stat().st_size
+        mtime = path.stat().st_mtime
+    except (OSError, ValueError, TypeError):
+        return False
+    if recorded_epoch.tzinfo is None:
+        recorded_epoch = recorded_epoch.replace(tzinfo=timezone.utc)
+    return size == file_size and mtime <= recorded_epoch.timestamp()
+
+
+def find_existing_download(info: dict) -> Path:
+    """Return the path of a valid, previously completed download of this video.
+
+    Duplicate detection is based on the YouTube ``video_id`` alone. A record
+    only counts as a duplicate when the file at its recorded path still exists
+    AND still represents that recorded download (see ``_valid_media_state``).
+    Any record whose file was deleted, replaced, modified after the download,
+    or replaced by a manually created placeholder is NOT treated as a
+    duplicate; the caller proceeds to download again.
+
+    Returns None when no valid prior download of this video exists.
+    """
+    video_id = info.get("id")
+    if not video_id:
+        return None
+    try:
+        records = history.find_downloads(video_id)
+    except history.HistoryError as exc:
+        print(f"Warning: {exc}")
+        return None
+    for record in reversed(records):
+        filepath = record.get("filepath")
+        if not filepath:
+            continue
+        path = Path(filepath)
+        if path.is_file() and _valid_media_state(record, path):
+            return path
+    return None
+
+
+def _safe_base(title: str) -> str:
+    return sanitize_filename(title, restricted=False) or "video"
+
+
+def _resolve_unique_base(title: str, output_dir: Path) -> str:
+    """Return a safe, collision-free base file name for the given title.
+
+    ``Title`` is preferred; if a media file already exists under that name
+    (belonging to a different video), ``Title (1)``, ``Title (2)``, ... are
+    tried instead. Unrelated existing files are never overwritten.
+    """
+    base = _safe_base(title)
+    candidate = base
+    counter = 1
+    while _media_for_base(output_dir, candidate) is not None:
+        candidate = f"{base} ({counter})"
+        counter += 1
+    return candidate
+
+
+def _make_options(url: str, selected: SelectedMediaFormat, output_dir: Path, base: str) -> dict:
+    return {
+        "format": selected.format_selector,
+        "outtmpl": str(output_dir / f"{base}.%(ext)s"),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "overwrites": False,
+        "noprogress": False,
+        "quiet": False,
+    }
+
+
+def _record(info: dict, selected: SelectedMediaFormat, result: Path) -> None:
+    duration = info.get("duration")
+    try:
+        history.record_download(
+            video_id=info.get("id") or "",
+            title=info.get("title") or result.stem,
+            url=info.get("webpage_url") or info.get("original_url") or "",
+            filename=result.name,
+            filepath=str(result),
+            quality=selected.height,
+            duration=duration,
+            file_size=result.stat().st_size,
+        )
+    except history.HistoryError as exc:
+        print(f"Warning: {exc}")
+
+
+def _download(url: str, selected: SelectedMediaFormat, output_dir: Path, base: str) -> None:
+    options = _make_options(url, selected, output_dir, base)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+    except DownloadError as exc:
+        reason = exc.exc_info[1] if exc.exc_info and exc.exc_info[1] else str(exc)
+        raise DownloadFailure(str(reason)) from exc
+
+
+def download_media(info: dict, selected: SelectedMediaFormat, output_dir: Path) -> Path:
+    """Download the media described by ``info`` using the selected formats.
+
+    Returns the path to the completed file. If the same video is already
+    downloaded (matching history record whose file still exists), the existing
+    file is returned and nothing is re-downloaded. A successful download is
+    recorded in the download history only after the final file exists.
+    """
+    url = info.get("webpage_url") or info.get("original_url")
+    if not url:
+        raise DownloadFailure("No downloadable URL available.")
+
+    existing = find_existing_download(info)
+    if existing:
+        return existing
+
+    base = _resolve_unique_base(info.get("title") or "video", output_dir)
+    _download(url, selected, output_dir, base)
+
+    result = _media_for_base(output_dir, base)
+    if result is None:
+        raise DownloadFailure("Download reported success but no file was found.")
+
+    _record(info, selected, result)
+    return result
