@@ -378,30 +378,8 @@ def _handle_playlist(info: dict) -> bool:
     return answer in ("y", "yes")
 
 
-def _run_download() -> None:
-    print("DownV - Media Downloader")
-    print()
-    url = prompt_for_url()
-    print()
-    print("Fetching media information...")
-
-    try:
-        info = get_media_info(url)
-    except MediaInfoError as exc:
-        print("✗ Failed to retrieve media information.")
-        print()
-        print(f"Reason: {exc}")
-        return
-
-    if "entries" in info:
-        if _handle_playlist(info):
-            print()
-            print("✓ Playlist confirmed")
-        else:
-            print()
-            print("Download cancelled.")
-        return
-
+def _download_video(info: dict) -> None:
+    """Process a single video through the shared download pipeline."""
     display_info(info)
 
     qualities = select_formats(info)
@@ -453,6 +431,89 @@ def _run_download() -> None:
 
     print()
     print("✓ Download completed")
+
+
+def _playlist_entry_url(entry: dict) -> str | None:
+    return (
+        entry.get("webpage_url")
+        or entry.get("original_url")
+        or entry.get("url")
+    )
+
+
+def _resolve_playlist_entry(entry) -> dict | None:
+    """Return a fully-resolved single-video info dict for a playlist entry.
+
+    Fully-resolved entries (those already carrying ``formats``) are returned
+    unchanged. Partial entries are resolved through the extractor using their
+    URL. Returns None when the entry is unusable or could not be resolved.
+    """
+    if not isinstance(entry, dict):
+        return None
+    if "formats" in entry:
+        return entry
+    url = _playlist_entry_url(entry)
+    if not url:
+        return None
+    try:
+        return get_media_info(url)
+    except MediaInfoError:
+        return None
+
+
+def _process_playlist(info: dict) -> None:
+    """Download every playlist entry sequentially via the single-video pipeline.
+
+    Entries are processed one at a time; malformed or unresolvable entries are
+    reported and skipped without stopping the remaining playlist.
+    """
+    entries = info.get("entries") or []
+    for number, entry in enumerate(entries, start=1):
+        print(f"Playlist item {number}")
+        entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
+        print(f"  Title : {entry_title}")
+        resolved = _resolve_playlist_entry(entry)
+        if resolved is None:
+            print()
+            print(f"✗ Could not resolve playlist item {number}.")
+            print()
+            continue
+        print()
+        try:
+            _download_video(resolved)
+        except Exception as exc:
+            print(f"✗ Failed to download playlist item {number}.")
+            print()
+            print(f"Reason: {exc}")
+
+
+def _run_download() -> None:
+    print("DownV - Media Downloader")
+    print()
+    url = prompt_for_url()
+    print()
+    print("Fetching media information...")
+
+    try:
+        info = get_media_info(url)
+    except MediaInfoError as exc:
+        print("✗ Failed to retrieve media information.")
+        print()
+        print(f"Reason: {exc}")
+        return
+
+    if "entries" in info:
+        if _handle_playlist(info):
+            print()
+            print("✓ Playlist confirmed")
+            print()
+            _process_playlist(info)
+        else:
+            print()
+            print("Download cancelled.")
+        return
+
+    _download_video(info)
 
 
 def main() -> None:
