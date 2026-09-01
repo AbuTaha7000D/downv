@@ -660,6 +660,239 @@ def _plan_playlist(info: dict) -> tuple:
     return chosen_height, per_item
 
 
+def _build_playlist_items(info: dict, per_item: list | None = None) -> list:
+    """Build item descriptors (``index``, ``entry``, ``resolved``, ``qualities``).
+
+    The descriptors are shared by the initial playlist run and any retry runs so
+    both reuse the same processing logic. When ``per_item`` is provided (from
+    the planning phase), the already-resolved entry info and its precomputed
+    quality map are carried over so neither entries nor ``select_formats`` are
+    recomputed. Otherwise ``resolved``/``qualities`` start as None and are
+    resolved lazily during processing.
+    """
+    entries = info.get("entries") or []
+    items = []
+    for index, entry in enumerate(entries):
+        if per_item is not None:
+            items.append(
+                {
+                    "index": index,
+                    "entry": entry,
+                    "resolved": per_item[index]["resolved"],
+                    "qualities": per_item[index]["qualities"],
+                }
+            )
+        else:
+            items.append({"index": index, "entry": entry, "resolved": None, "qualities": None})
+    return items
+
+
+def _process_items(
+    items: list,
+    chosen_height: int | None,
+    playlist_dir: Path | None,
+    label: str,
+    known_count: int | None = None,
+) -> tuple:
+    """Process a collection of playlist item descriptors through the shared pipeline.
+
+    ``items`` is a list of :func:`_build_playlist_items` descriptors. Each item
+    is classified into exactly one category (downloaded/skipped/failed/
+    unresolved) and this helper returns ``(stats, failed, skipped, unresolved)``
+    where ``stats`` holds the tallies and the three category lists carry the
+    report dicts plus the retry metadata (``index``, ``entry``, ``resolved``,
+    ``qualities``). The same helper powers the initial run (``label``
+    ``"Playlist item"``) and each retry run (``label`` ``"Retry item"``); for
+    retry, items whose ``resolved`` is None are resolved again so previously
+    unresolvable items get another chance.
+
+    ``known_count`` is the display total used for the per-item progress
+    denominator (``Playlist item N/known_count``). The initial run passes the
+    playlist count, which may be unknown/None so no denominator is fabricated;
+    a retry passes the size of the retry subset so progress is shown relative
+    to it.
+    """
+    stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
+    failed_items = []
+    skipped_items = []
+    unresolved_items = []
+    total = known_count if known_count else None
+    for number, item in enumerate(items, start=1):
+        entry = item["entry"]
+        resolved = item.get("resolved")
+        qualities = item.get("qualities")
+        stats["total"] += 1
+        denominator = f"/{total}" if total else ""
+        print(f"{label} {number}{denominator}")
+        entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
+        print(f"  Title : {entry_title}")
+        if resolved is None:
+            resolved = _resolve_playlist_entry(entry)
+        if resolved is None:
+            stats["unresolved"] += 1
+            print()
+            print(f"✗ Could not resolve playlist item {number}.")
+            print()
+            unresolved_items.append(
+                {
+                    "index": item["index"],
+                    "entry": entry,
+                    "resolved": None,
+                    "qualities": None,
+                    "title": _item_title(None, entry),
+                    "reason": "Could not resolve video information.",
+                }
+            )
+            continue
+        print()
+        failed_reason = []
+        try:
+            if chosen_height is not None:
+                if qualities is None:
+                    qualities = select_formats(resolved)
+                selected = qualities.get(chosen_height)
+                if selected is None:
+                    stats["failed"] += 1
+                    print(f"  Quality {chosen_height}p not available for this item.")
+                    print()
+                    failed_items.append(
+                        {
+                            "index": item["index"],
+                            "entry": entry,
+                            "resolved": resolved,
+                            "qualities": qualities,
+                            "title": _item_title(resolved, entry),
+                            "reason": "Selected quality not available.",
+                        }
+                    )
+                    continue
+                outcome = _download_video(
+                    resolved, selected=selected, output_dir=playlist_dir, failed_reason=failed_reason
+                )
+                if outcome == "failed":
+                    reason = failed_reason[0].strip() if failed_reason else "Download failed."
+                    failed_items.append(
+                        {
+                            "index": item["index"],
+                            "entry": entry,
+                            "resolved": resolved,
+                            "qualities": qualities,
+                            "title": _item_title(resolved, entry),
+                            "reason": reason,
+                        }
+                    )
+                elif outcome == "skipped":
+                    skipped_items.append(
+                        {
+                            "index": item["index"],
+                            "entry": entry,
+                            "resolved": resolved,
+                            "qualities": qualities,
+                            "title": _item_title(resolved, entry),
+                            "reason": "Already downloaded.",
+                        }
+                    )
+                stats[outcome] += 1
+            else:
+                outcome = _download_video(resolved)
+                if outcome == "failed":
+                    failed_items.append(
+                        {
+                            "index": item["index"],
+                            "entry": entry,
+                            "resolved": resolved,
+                            "qualities": qualities,
+                            "title": _item_title(resolved, entry),
+                            "reason": "Download failed.",
+                        }
+                    )
+                elif outcome == "skipped":
+                    skipped_items.append(
+                        {
+                            "index": item["index"],
+                            "entry": entry,
+                            "resolved": resolved,
+                            "qualities": qualities,
+                            "title": _item_title(resolved, entry),
+                            "reason": "Already downloaded.",
+                        }
+                    )
+                stats[outcome] += 1
+        except Exception as exc:
+            stats["failed"] += 1
+            print(f"✗ Failed to download playlist item {number}.")
+            print()
+            print(f"Reason: {exc}")
+            failed_items.append(
+                {
+                    "index": item["index"],
+                    "entry": entry,
+                    "resolved": resolved,
+                    "qualities": qualities,
+                    "title": _item_title(resolved, entry),
+                    "reason": str(exc).strip() or "Download failed.",
+                }
+            )
+
+    return stats, failed_items, skipped_items, unresolved_items
+
+
+def _report_playlist_complete(stats: dict, failed: list, skipped: list, unresolved: list) -> None:
+    """Print the playlist summary followed by the skipped/unresolved/failed report sections."""
+    _print_playlist_summary(stats)
+    _print_item_report("Skipped items:", skipped, "-")
+    _print_item_report("Unresolved items:", unresolved, "?")
+    _print_item_report("Failed items:", failed, "✗")
+
+
+def _print_retry_summary(stats: dict) -> None:
+    """Print the summary shown after a retry run of a playlist subset."""
+    print()
+    print("Retry complete")
+    print()
+    print(f"  Retried     : {stats['total']}")
+    print(f"  Downloaded  : {stats['downloaded']}")
+    if stats["skipped"]:
+        print(f"  Skipped     : {stats['skipped']}")
+    print(f"  Failed      : {stats['failed']}")
+    print(f"  Unresolved  : {stats['unresolved']}")
+
+
+def _run_with_retries(
+    items: list, chosen_height: int | None, playlist_dir: Path | None, known_count: int | None = None
+) -> None:
+    """Run the initial playlist pass, then offer explicit retries for pending items.
+
+    The initial pass processes every item and reports the playlist summary. If
+    any item failed or could not be resolved, the user is asked whether to retry
+    only those items; the retry reuses the same chosen quality and playlist
+    directory and re-runs the shared :func:`_process_items` on the pending
+    subset in original playlist order. Retries are always explicit — a retry is
+    offered again only while pending items remain and the user answers yes.
+
+    ``known_count`` is the initial run's progress denominator (it may be None
+    for a playlist of unknown size, so no fabricated total is shown).
+    """
+    stats, failed, skipped, unresolved = _process_items(
+        items, chosen_height, playlist_dir, "Playlist item", known_count
+    )
+    _report_playlist_complete(stats, failed, skipped, unresolved)
+    while failed or unresolved:
+        pending = sorted(failed + unresolved, key=lambda d: d["index"])
+        answer = input("\nRetry failed/unresolved items? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            break
+        retry_items = [
+            {"index": p["index"], "entry": p["entry"], "resolved": p["resolved"], "qualities": p["qualities"]}
+            for p in pending
+        ]
+        print()
+        stats, failed, skipped, unresolved = _process_items(
+            retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items)
+        )
+        _print_retry_summary(stats)
+
+
 def _process_playlist(
     info: dict,
     chosen_height: int | None = None,
@@ -679,86 +912,11 @@ def _process_playlist(
     already-resolved entry info and its precomputed quality map, so neither
     entries nor ``select_formats`` are recomputed here.
     """
-    stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
-    entries = info.get("entries") or []
-    total = _safe_playlist_count(info)
-    failed_items = []
-    skipped_items = []
-    unresolved_items = []
-    for number, entry in enumerate(entries, start=1):
-        stats["total"] += 1
-        denominator = f"/{total}" if total else ""
-        print(f"Playlist item {number}{denominator}")
-        entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
-        print(f"  Title : {entry_title}")
-        if per_item is not None:
-            resolved = per_item[number - 1]["resolved"]
-            item_qualities = per_item[number - 1]["qualities"]
-        else:
-            resolved = _resolve_playlist_entry(entry)
-            item_qualities = None
-        if resolved is None:
-            stats["unresolved"] += 1
-            print()
-            print(f"✗ Could not resolve playlist item {number}.")
-            print()
-            unresolved_items.append(
-                {
-                    "title": _item_title(None, entry),
-                    "reason": "Could not resolve video information.",
-                }
-            )
-            continue
-        print()
-        failed_reason = []
-        try:
-            if chosen_height is not None:
-                if item_qualities is None:
-                    item_qualities = select_formats(resolved)
-                selected = item_qualities.get(chosen_height)
-                if selected is None:
-                    stats["failed"] += 1
-                    print(f"  Quality {chosen_height}p not available for this item.")
-                    print()
-                    failed_items.append(
-                        {"title": _item_title(resolved, entry), "reason": "Selected quality not available."}
-                    )
-                    continue
-                outcome = _download_video(
-                    resolved, selected=selected, output_dir=playlist_dir, failed_reason=failed_reason
-                )
-                if outcome == "failed":
-                    reason = failed_reason[0].strip() if failed_reason else "Download failed."
-                    failed_items.append({"title": _item_title(resolved, entry), "reason": reason})
-                elif outcome == "skipped":
-                    skipped_items.append(
-                        {"title": _item_title(resolved, entry), "reason": "Already downloaded."}
-                    )
-                stats[outcome] += 1
-            else:
-                outcome = _download_video(resolved)
-                if outcome == "failed":
-                    failed_items.append(
-                        {"title": _item_title(resolved, entry), "reason": "Download failed."}
-                    )
-                elif outcome == "skipped":
-                    skipped_items.append(
-                        {"title": _item_title(resolved, entry), "reason": "Already downloaded."}
-                    )
-                stats[outcome] += 1
-        except Exception as exc:
-            stats["failed"] += 1
-            print(f"✗ Failed to download playlist item {number}.")
-            print()
-            print(f"Reason: {exc}")
-            failed_items.append(
-                {"title": _item_title(resolved, entry), "reason": str(exc).strip() or "Download failed."}
-            )
-
-    _print_playlist_summary(stats)
-    _print_item_report("Skipped items:", skipped_items, "-")
-    _print_item_report("Unresolved items:", unresolved_items, "?")
-    _print_item_report("Failed items:", failed_items, "✗")
+    items = _build_playlist_items(info, per_item)
+    stats, failed, skipped, unresolved = _process_items(
+        items, chosen_height, playlist_dir, "Playlist item", _safe_playlist_count(info)
+    )
+    _report_playlist_complete(stats, failed, skipped, unresolved)
     return stats
 
 
@@ -793,7 +951,12 @@ def _run_download() -> None:
                 return
             print(f"✓ Playlist directory ready: {playlist_dir}/")
             print()
-            _process_playlist(info, chosen_height=chosen_height, playlist_dir=playlist_dir, per_item=per_item)
+            _run_with_retries(
+                _build_playlist_items(info, per_item),
+                chosen_height=chosen_height,
+                playlist_dir=playlist_dir,
+                known_count=_safe_playlist_count(info),
+            )
         else:
             print()
             print("Download cancelled.")

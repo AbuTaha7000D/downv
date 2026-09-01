@@ -133,7 +133,9 @@ def test_run_download_playlist_confirmed_no_media_download(monkeypatch, capsys):
     monkeypatch.setattr(cli, "download_media", lambda *a, **k: pytest.fail("download called"))
     monkeypatch.setattr(cli, "find_existing_download", lambda info: None)
     monkeypatch.setattr(cli, "select_formats", lambda info: {})
-    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+    # Answer the confirmation prompt "y" but decline any post-run retry prompt
+    # (the fake playlist has no resolvable items, which now offers a retry).
+    monkeypatch.setattr("builtins.input", lambda prompt: "n" if "Retry" in prompt else "y")
     monkeypatch.setattr(sys, "argv", ["downv"])
 
     cli._run_download()
@@ -1858,3 +1860,405 @@ def test_playlist_report_lazy_safe(monkeypatch, tmp_path, capsys):
     assert stats["total"] == 3
     assert stats["downloaded"] == 3
     assert "Skipped items:" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 / Step 7.4: Playlist resume / retry UX
+# ---------------------------------------------------------------------------
+
+def _retry_item(index, entry, resolved=None, qualities=None):
+    return {"index": index, "entry": entry, "resolved": resolved, "qualities": qualities}
+
+
+def _retry_resolved_items(entries):
+    return [_retry_item(i, e, resolved=e, qualities={480: _selected()}) for i, e in enumerate(entries)]
+
+
+def _all_retry_prompts(prompts):
+    return [p for p in prompts if "Retry failed/unresolved items?" in p]
+
+
+def test_retry_no_prompt_when_everything_succeeds(monkeypatch, tmp_path, capsys):
+    """Test 1: with no failed/unresolved items no retry prompt is shown."""
+    entries = [_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")]
+    calls = []
+    monkeypatch.setattr(cli, "_download_video", lambda *a, **k: calls.append(a[0]["id"]) or "downloaded")
+    monkeypatch.setattr("builtins.input", lambda p: pytest.fail("retry prompt must not appear"))
+
+    cli._run_with_retries(_retry_resolved_items(entries), chosen_height=480, playlist_dir=tmp_path)
+    assert calls == ["v1", "v2", "v3"]
+    out = capsys.readouterr().out
+    assert "Playlist complete" in out
+    assert "Retry" not in out
+    assert "Retried" not in out
+
+
+def test_retry_prompt_appears_for_failed_and_decline_exits(monkeypatch, tmp_path, capsys):
+    """Test 2: a failed item shows the retry prompt; answering 'n' skips retry."""
+    entries = [_resolved("v1", "One")]
+    attempts = []
+    monkeypatch.setattr(cli, "_download_video", lambda *a, **k: attempts.append(a[0]["id"]) or "failed")
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or "n")
+
+    cli._run_with_retries(_retry_resolved_items(entries), chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert attempts == ["v1"]
+    assert len(_all_retry_prompts(prompts)) == 1
+    assert "Retried" not in out
+
+
+def test_retry_only_failed_items(monkeypatch, tmp_path, capsys):
+    """Test 3: only the failed item is retried; downloaded/skipped are untouched."""
+    entries = [_resolved("v1", "One"), _resolved("v2", "Two"), _resolved("v3", "Three")]
+    counts = {}
+
+    def fake_download(resolved, **k):
+        vid = resolved["id"]
+        n = counts.get(vid, 0) + 1
+        counts[vid] = n
+        if vid == "v3":
+            return "failed" if n == 1 else "downloaded"
+        return "skipped" if vid == "v2" else "downloaded"
+
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or "y")
+
+    cli._run_with_retries(_retry_resolved_items(entries), chosen_height=480, playlist_dir=tmp_path)
+    assert counts["v1"] == 1
+    assert counts["v2"] == 1
+    assert counts["v3"] == 2
+    assert len(_all_retry_prompts(prompts)) == 1
+    out = capsys.readouterr().out
+    assert "Retried     : 1" in out
+    assert "Downloaded  : 1" in out
+
+
+def test_retry_only_unresolved_items(monkeypatch, tmp_path, capsys):
+    """Test 4: an unresolved item is re-resolved and retried; success items untouched."""
+    entries = [_resolved("v1", "One"), _resolved("u1", "Two")]
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    resolve_state = {"u1": 0}
+
+    def fake_resolve(entry):
+        if entry["id"] == "u1":
+            resolve_state["u1"] += 1
+            return None if resolve_state["u1"] == 1 else entry
+        return entry
+
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    download_counts = {}
+
+    def fake_download(resolved, **k):
+        vid = resolved["id"]
+        download_counts[vid] = download_counts.get(vid, 0) + 1
+        return "downloaded"
+
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    items = [
+        _retry_item(0, entries[0], resolved=entries[0], qualities={480: _selected()}),
+        _retry_item(1, entries[1], resolved=None, qualities=None),
+    ]
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or "y")
+
+    cli._run_with_retries(items, chosen_height=480, playlist_dir=tmp_path)
+    assert download_counts["v1"] == 1
+    assert download_counts["u1"] == 1
+    assert resolve_state["u1"] == 2
+    out = capsys.readouterr().out
+    assert "Retried     : 1" in out
+    assert "Downloaded  : 1" in out
+
+
+def test_retry_mixed_failed_and_unresolved(monkeypatch, tmp_path, capsys):
+    """Test 5: mixed failed+unresolved retries exactly the pending items in order."""
+    entries = [
+        _resolved("dl", "DL"),
+        _resolved("fa", "FA"),
+        _resolved("fb", "FB"),
+        _resolved("dl2", "DL2"),
+        _resolved("ua", "UA"),
+    ]
+    attempts = []
+
+    def fake_download(*a, **k):
+        vid = a[0]["id"]
+        attempts.append(vid)
+        return "downloaded" if vid.startswith("dl") else "failed"
+
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", lambda e: attempts.append(e["id"]) or None)
+    items = [
+        _retry_item(0, entries[0], resolved=entries[0], qualities={480: _selected()}),
+        _retry_item(1, entries[1], resolved=entries[1], qualities={480: _selected()}),
+        _retry_item(2, entries[2], resolved=entries[2], qualities={480: _selected()}),
+        _retry_item(3, entries[3], resolved=entries[3], qualities={480: _selected()}),
+        _retry_item(4, entries[4], resolved=None, qualities=None),
+    ]
+    answers = iter(["y", "n"])
+    monkeypatch.setattr("builtins.input", lambda p: next(answers))
+
+    cli._run_with_retries(items, chosen_height=480, playlist_dir=tmp_path)
+    # Initial pass downloads dl & dl2, fails fa & fb, leaves ua unresolved.
+    # Retry batch is the two failed (fa, fb) then the unresolved (ua) in order.
+    assert attempts[-3:] == ["fa", "fb", "ua"]
+
+
+def test_retry_success_clears_pending(monkeypatch, tmp_path, capsys):
+    """Test 6: a failed item that succeeds on retry is reported downloaded and no longer pending."""
+    entries = [_resolved("v1", "One")]
+    n = [0]
+
+    def fake_download(*a, **k):
+        n[0] += 1
+        return "failed" if n[0] == 1 else "downloaded"
+
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or "y")
+
+    cli._run_with_retries(_retry_resolved_items(entries), chosen_height=480, playlist_dir=tmp_path)
+    assert n[0] == 2
+    assert len(_all_retry_prompts(prompts)) == 1
+    out = capsys.readouterr().out
+    assert "Retried     : 1" in out
+    assert "Downloaded  : 1" in out
+    assert "Failed      : 0" in out
+
+
+def test_retry_remains_failed_offers_again(monkeypatch, tmp_path, capsys):
+    """Test 7: an item that keeps failing is offered another retry."""
+    entries = [_resolved("v1", "One")]
+    n = [0]
+    monkeypatch.setattr(cli, "_download_video", lambda *a, **k: n.__setitem__(0, n[0] + 1) or "failed")
+    prompts = []
+    answers = iter(["y", "n"])
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or next(answers))
+
+    cli._run_with_retries(_retry_resolved_items(entries), chosen_height=480, playlist_dir=tmp_path)
+    assert n[0] == 2
+    assert len(_all_retry_prompts(prompts)) == 2
+
+
+def test_retry_remains_unresolved_no_crash(monkeypatch, tmp_path, capsys):
+    """Test 8: an unresolved item that cannot resolve again stays unresolved without crashing."""
+    entries = [_resolved("u1", "Two")]
+    resolve_calls = [0]
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", lambda e: resolve_calls.__setitem__(0, resolve_calls[0] + 1) or None)
+    prompts = []
+    answers = iter(["y", "n"])
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or next(answers))
+
+    cli._run_with_retries(
+        [_retry_item(0, entries[0], resolved=None, qualities=None)], chosen_height=480, playlist_dir=tmp_path
+    )
+    assert resolve_calls[0] == 2
+    assert len(_all_retry_prompts(prompts)) == 2
+    out = capsys.readouterr().out
+    assert "Unresolved : 1" in out
+
+
+def test_retry_quality_menu_once_and_preserved(monkeypatch, tmp_path, data_dir, capsys):
+    """Test 9: the quality menu appears only once and retry reuses the chosen quality."""
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One")])
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    quality_calls = []
+    monkeypatch.setattr(cli, "select_quality", lambda q: quality_calls.append(1) or q[480])
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    state = {"v1": 0}
+
+    def fake_download(info_, sel, out):
+        state["v1"] += 1
+        if state["v1"] == 1:
+            raise DownloadFailure("boom")
+        target = out / f"{info_['id']}.mp4"
+        target.write_bytes(b"d")
+        return target
+
+    monkeypatch.setattr(cli, "download_media", fake_download)
+    answers = iter(["http://x", "y", "y"])
+    monkeypatch.setattr("builtins.input", lambda p: next(answers))
+    monkeypatch.setattr(sys, "argv", ["downv"])
+
+    cli._run_download()
+    out = capsys.readouterr().out
+    assert len(quality_calls) == 1
+    assert out.count("Playlist quality") == 1
+    assert "Retry complete" in out
+    assert "Retried     : 1" in out
+
+
+def test_retry_uses_same_output_directory(monkeypatch, tmp_path, data_dir, capsys):
+    """Test 10: retry writes into the same playlist directory."""
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One")])
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    seen_dirs = []
+    state = {"v1": 0}
+
+    def fake_download(info_, sel, out):
+        seen_dirs.append(str(out))
+        state["v1"] += 1
+        if state["v1"] == 1:
+            raise DownloadFailure("boom")
+        target = out / f"{info_['id']}.mp4"
+        target.write_bytes(b"d")
+        return target
+
+    monkeypatch.setattr(cli, "download_media", fake_download)
+    answers = iter(["http://x", "y", "y"])
+    monkeypatch.setattr("builtins.input", lambda p: next(answers))
+    monkeypatch.setattr(sys, "argv", ["downv"])
+
+    cli._run_download()
+    pdir = tmp_path / "My_Playlist"
+    assert len(seen_dirs) == 2
+    assert seen_dirs[0] == str(pdir) and seen_dirs[1] == str(pdir)
+    assert (pdir / "v1.mp4").exists()
+    assert not (tmp_path / "v1.mp4").exists()
+
+
+def test_retry_order_preserved_for_non_adjacent_pending(monkeypatch, tmp_path, capsys):
+    """Test 11: non-adjacent failed/unresolved items retry in original playlist order."""
+    entries = [
+        _resolved("fa", "FA"),
+        _resolved("ok1", "OK1"),
+        _resolved("ua", "UA"),
+        _resolved("ok2", "OK2"),
+        _resolved("fb", "FB"),
+    ]
+    attempts = []
+
+    def fake_download(*a, **k):
+        vid = a[0]["id"]
+        attempts.append(vid)
+        return "downloaded" if vid.startswith("ok") else "failed"
+
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", lambda e: attempts.append(e["id"]) or None)
+    # Playlist order: fa(fail), ok1(download), ua(unresolved), ok2(download), fb(fail)
+    # Pending items are fa (index 0), ua (index 2), fb (index 4) -> must retry fa, ua, fb
+    items = [
+        _retry_item(0, entries[0], resolved=entries[0], qualities={480: _selected()}),
+        _retry_item(1, entries[1], resolved=entries[1], qualities={480: _selected()}),
+        _retry_item(2, entries[2], resolved=None, qualities=None),  # unresolved
+        _retry_item(3, entries[3], resolved=entries[3], qualities={480: _selected()}),
+        _retry_item(4, entries[4], resolved=entries[4], qualities={480: _selected()}),
+    ]
+    answers = iter(["y", "n"])
+    monkeypatch.setattr("builtins.input", lambda p: next(answers))
+
+    cli._run_with_retries(items, chosen_height=480, playlist_dir=tmp_path)
+    # Initial pass downloads ok1 & ok2, fails fa & fb, unresolved ua.
+    # Retry batch (in original playlist order) = fa, ua, fb.
+    assert attempts[-3:] == ["fa", "ua", "fb"]
+
+
+def test_retry_declined_no_processing(monkeypatch, tmp_path, capsys):
+    """Test 12: declining the retry runs no further processing and exits normally."""
+    entries = [_resolved("v1", "One")]
+    attempts = []
+    monkeypatch.setattr(cli, "_download_video", lambda *a, **k: attempts.append(a[0]["id"]) or "failed")
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or "n")
+
+    cli._run_with_retries(_retry_resolved_items(entries), chosen_height=480, playlist_dir=tmp_path)
+    assert attempts == ["v1"]
+    assert len(_all_retry_prompts(prompts)) == 1
+    out = capsys.readouterr().out
+    assert "Playlist complete" in out
+    assert "Retried" not in out
+
+
+def test_retry_multiple_rounds_two_explicit_confirmations(monkeypatch, tmp_path, capsys):
+    """Test 13: multiple retry rounds each require explicit confirmation; no auto-retry."""
+    entries = [_resolved("fA", "FA"), _resolved("fB", "FB"), _resolved("uA", "UA")]
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    counts = {}
+
+    def fake_download(*a, **k):
+        vid = a[0]["id"]
+        n = counts.get(vid, 0) + 1
+        counts[vid] = n
+        if vid == "fA":
+            return "failed" if n < 3 else "downloaded"
+        if vid == "fB":
+            return "failed" if n < 2 else "downloaded"
+        return "downloaded"
+
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    resolve_state = {"uA": 0}
+
+    def fake_resolve(entry):
+        resolve_state[entry["id"]] += 1
+        # uA resolves on its 3rd attempt (initial + retry1 + retry2)
+        return None if resolve_state[entry["id"]] < 3 else entry
+
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    items = [
+        _retry_item(0, entries[0], resolved=entries[0], qualities={480: _selected()}),
+        _retry_item(1, entries[1], resolved=entries[1], qualities={480: _selected()}),
+        _retry_item(2, entries[2], resolved=None, qualities=None),
+    ]
+    prompts = []
+    answers = iter(["y", "y", "y", "y"])
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or next(answers))
+
+    cli._run_with_retries(items, chosen_height=480, playlist_dir=tmp_path)
+    retry_prompts = _all_retry_prompts(prompts)
+    # 1 after initial run, 1 after retry round one -> two explicit confirmations.
+    assert len(retry_prompts) == 2
+    # Round progression: initial: fA fail, fB fail, uA unresolved.
+    # Retry1: fA fail(2), fB ok(2), uA unresolved(2). Retry2: fA ok(3), uA ok(3).
+    assert counts["fA"] == 3
+    assert counts["fB"] == 2
+    assert resolve_state["uA"] == 3
+    out = capsys.readouterr().out
+    assert out.count("Retry complete") == 2
+
+
+def test_retry_reporting_and_step72_73_regression(monkeypatch, tmp_path, capsys):
+    """Test 14: retry summary plus the existing failed/skipped/unresolved reports coexist."""
+    entries = [
+        _resolved("dl", "DL"),
+        _resolved("sk", "SK"),
+        _resolved("fl", "FL"),
+        _resolved("ur", "UR"),
+    ]
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+
+    def fake_download(*a, **k):
+        vid = a[0]["id"]
+        return "failed" if vid == "fl" else ("skipped" if vid == "sk" else "downloaded")
+
+    monkeypatch.setattr(cli, "_download_video", fake_download)
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", lambda e: None)
+    items = [
+        _retry_item(0, entries[0], resolved=entries[0], qualities={480: _selected()}),
+        _retry_item(1, entries[1], resolved=entries[1], qualities={480: _selected()}),
+        _retry_item(2, entries[2], resolved=entries[2], qualities={480: _selected()}),
+        _retry_item(3, entries[3], resolved=None, qualities=None),
+    ]
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p: prompts.append(p) or "n")
+
+    cli._run_with_retries(items, chosen_height=480, playlist_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert "Downloaded : 1" in out
+    assert "Skipped    : 1" in out
+    assert "Failed     : 1" in out
+    assert "Unresolved : 1" in out
+    assert "Skipped items:" in out and "Reason: Already downloaded." in out
+    assert "Unresolved items:" in out and "Reason: Could not resolve video information." in out
+    assert "Failed items:" in out and "  ✗ FL" in out
