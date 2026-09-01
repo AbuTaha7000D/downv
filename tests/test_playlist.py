@@ -852,3 +852,122 @@ def test_playlist_legacy_existing_record_skipped(monkeypatch, tmp_path, data_dir
     assert stats == {"total": 1, "downloaded": 0, "skipped": 1, "failed": 0, "unresolved": 0}
     assert history.count_history() == 1
     assert history.find_download("v1")["title"] == "Legacy"
+
+
+def _url_only_entry(vid, title):
+    return {
+        "id": vid,
+        "title": title,
+        "url": f"https://example.com/watch?v={vid}",
+        "formats": [{"format_id": "0", "height": 480, "vcodec": "avc1", "acodec": "mp4a", "filesize": 1000}],
+        "duration": 60,
+    }
+
+
+def test_resolve_playlist_entry_forwards_url_only_format_entry(monkeypatch):
+    """A resolved entry with only a ``url`` must still yield a usable download URL."""
+    entry = _url_only_entry("v1", "One")
+    resolved = cli._resolve_playlist_entry(entry)
+    assert resolved is not None
+    assert resolved.get("webpage_url")
+    assert resolved.get("original_url")
+
+
+def test_playlist_url_only_resolved_entry_downloads(monkeypatch, tmp_path, data_dir, capsys):
+    """Regression: a fully-resolved entry whose only URL field is ``url`` must
+    download successfully instead of failing for lack of a usable URL."""
+    _pipeline_patches(monkeypatch, tmp_path)
+    info = _playlist_info(entries=[_url_only_entry("v1", "One")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 1, "downloaded": 1, "skipped": 0, "failed": 0, "unresolved": 0}
+    assert history.count_history() == 1
+    assert "✓ Download completed" in capsys.readouterr().out
+
+
+def test_resolve_playlist_entry_resolved_entry_unchanged_when_webpage_url_present(monkeypatch):
+    entry = _resolved("v1", "One")
+    resolved = cli._resolve_playlist_entry(entry)
+    assert resolved is entry  # reused as-is, not copied/mutated
+    assert resolved.get("webpage_url")
+
+
+def test_playlist_resolved_entry_with_no_url_is_unresolved(monkeypatch, capsys):
+    """A fully-resolved entry (has formats) but no URL at all must be unresolved."""
+    entry = {"id": "v1", "title": "One", "formats": [{}]}
+    assert cli._resolve_playlist_entry(entry) is None
+    info = _playlist_info(title="No Url", entries=[entry])
+    monkeypatch.setattr(cli, "_download_video", lambda e: pytest.fail("must not download"))
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 1, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 1}
+
+
+def test_playlist_multiple_failures_all_counted_and_continue(monkeypatch, tmp_path, data_dir, capsys):
+    """Several failing items are all counted Failed and later items still run."""
+
+    def flaky(entry, selected, output_dir):
+        raise DownloadFailure(f"boom {entry['id']}")
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "download_media", flaky)
+    info = _playlist_info(entries=[_resolved("a", "A"), _resolved("b", "B"), _resolved("c", "C")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 3, "downloaded": 0, "skipped": 0, "failed": 3, "unresolved": 0}
+    assert history.count_history() == 0
+    out = capsys.readouterr().out
+    assert "Playlist item 1" in out and "Playlist item 2" in out and "Playlist item 3" in out
+
+
+def test_playlist_non_download_failure_exception_is_failed_and_continues(monkeypatch, tmp_path, data_dir, capsys):
+    """An unexpected (non-DownloadFailure) exception in an item is counted as
+    Failed and does not stop later items."""
+
+    def unexpected(entry, selected, output_dir):
+        if entry["id"] == "a":
+            raise ValueError("unexpected")
+        return _pipeline_downloaded(entry, selected, output_dir)
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "download_media", unexpected)
+    info = _playlist_info(entries=[_resolved("a", "A"), _resolved("b", "B")])
+    stats = _summary(cli._process_playlist(info))
+    assert stats == {"total": 2, "downloaded": 1, "skipped": 0, "failed": 1, "unresolved": 0}
+    assert history.find_download("b") is not None
+    assert history.find_download("a") is None
+    assert "unexpected" in capsys.readouterr().out
+
+
+def test_playlist_summary_invariant_every_category(monkeypatch, tmp_path, data_dir, capsys):
+    """A single playlist producing every category must satisfy
+    Total == Downloaded + Skipped + Failed + Unresolved."""
+    entry_a = _resolved("a", "A")
+    entry_b = _resolved("b", "B")
+    entry_c = _resolved("c", "C")
+    entry_d = _partial("d", "D")
+    info = _playlist_info(
+        title="All",
+        entries=[entry_a, entry_a, entry_b, entry_c, entry_d, None],
+    )
+    failed = {"c"}
+
+    def fake_download(entry, selected, output_dir):
+        if entry["id"] in failed:
+            raise DownloadFailure("boom")
+        return _pipeline_downloaded(entry, selected, output_dir)
+
+    def fake_resolve(entry):
+        if not isinstance(entry, dict) or entry.get("id") == "d":
+            return None
+        return entry
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "download_media", fake_download)
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    stats = _summary(cli._process_playlist(info))
+    # a (twice -> 1 download + 1 skip), b download, c failed, d unresolved, None unresolved
+    assert stats == {"total": 6, "downloaded": 2, "skipped": 1, "failed": 1, "unresolved": 2}

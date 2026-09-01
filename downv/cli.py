@@ -458,6 +458,19 @@ def _resolve_playlist_entry(entry) -> dict | None:
     if not isinstance(entry, dict):
         return None
     if "formats" in entry:
+        # A resolved entry is only useful to the download pipeline when it has a
+        # usable download URL (``webpage_url``/``original_url``). Some entries
+        # (notably extractor output) carry only a plain ``url``; forward that so
+        # the downloader is not left without a URL. Returns a shallow copy only
+        # when normalizing, to avoid mutating the caller's dict.
+        if not (entry.get("webpage_url") or entry.get("original_url")):
+            url = entry.get("url")
+            if not url:
+                return None
+            resolved = dict(entry)
+            resolved["original_url"] = resolved.get("original_url") or url
+            resolved["webpage_url"] = resolved.get("webpage_url") or url
+            return resolved
         return entry
     url = _playlist_entry_url(entry)
     if not url:
