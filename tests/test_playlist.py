@@ -971,3 +971,288 @@ def test_playlist_summary_invariant_every_category(monkeypatch, tmp_path, data_d
     stats = _summary(cli._process_playlist(info))
     # a (twice -> 1 download + 1 skip), b download, c failed, d unresolved, None unresolved
     assert stats == {"total": 6, "downloaded": 2, "skipped": 1, "failed": 1, "unresolved": 2}
+
+
+# ---------------------------------------------------------------------------
+# Phase 6F: Playlist-wide quality selection & playlist directory organisation
+# ---------------------------------------------------------------------------
+
+def test_playlist_dir_name_sanitizes_safely():
+    assert cli.playlist_dir_name("My Playlist") == "My_Playlist"
+    assert cli.playlist_dir_name("A/B:C*D") != "A/B:C*D"  # separates path/file chars
+    assert not any(c in cli.playlist_dir_name("A/B:C*D") for c in "/:*")
+    assert cli.playlist_dir_name("") == "Playlist"
+    assert cli.playlist_dir_name(None) == "Playlist"
+    assert cli.playlist_dir_name("   ") == "Playlist"
+    assert cli.playlist_dir_name("..") == "Playlist"
+
+
+def test_playlist_dir_name_does_not_mutate_title():
+    title = "Hi/There"
+    cli.playlist_dir_name(title)
+    assert title == "Hi/There"
+
+
+def test_playlist_dir_name_truncates_long_titles(monkeypatch):
+    long_title = "X" * 500
+    name = cli.playlist_dir_name(long_title)
+    assert len(name) <= cli._MAX_PLAYLIST_DIR_NAME
+
+
+def test_playlist_output_dir_lives_under_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    target = cli._playlist_output_dir("My Playlist")
+    assert target == tmp_path / "My_Playlist"
+    assert target.exists()
+    assert target.is_dir()
+
+
+def test_playlist_output_dir_exists_ok(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    (tmp_path / "My_Playlist").mkdir()
+    target = cli._playlist_output_dir("My Playlist")
+    assert target == tmp_path / "My_Playlist"
+    assert target.exists()
+
+
+def test_aggregate_playlist_qualities_sums_across_items():
+    per_item = [
+        {"resolved": {"id": "a"}, "qualities": {480: SelectedMediaFormat(480, "0", None, 1000)}},
+        {"resolved": {"id": "b"}, "qualities": {480: SelectedMediaFormat(480, "0", None, 2000)}},
+        {"resolved": {"id": "c"}, "qualities": {480: SelectedMediaFormat(480, "0", None, 3000)}},
+    ]
+    agg = cli._aggregate_playlist_qualities(per_item)
+    assert set(agg) == {480}
+    assert agg[480].size_bytes == 6000
+    assert agg[480].height == 480
+
+
+def test_aggregate_playlist_qualities_ignores_unresolved():
+    per_item = [
+        {"resolved": {"id": "a"}, "qualities": {480: _selected()}},
+        {"resolved": None, "qualities": {}},
+        {"resolved": {"id": "b"}, "qualities": {480: _selected()}},
+    ]
+    agg = cli._aggregate_playlist_qualities(per_item)
+    assert set(agg) == {480}
+    assert agg[480].size_bytes == 2000
+
+
+def test_aggregate_playlist_qualities_unknown_when_any_unknown():
+    per_item = [
+        {"resolved": {"id": "a"}, "qualities": {480: SelectedMediaFormat(480, "0", None, 1000)}},
+        {"resolved": {"id": "b"}, "qualities": {480: SelectedMediaFormat(480, "0", None, None)}},
+    ]
+    agg = cli._aggregate_playlist_qualities(per_item)
+    assert agg[480].size_bytes is None
+
+
+def test_choose_playlist_quality_returns_none_when_empty(monkeypatch):
+    monkeypatch.setattr(cli, "_aggregate_playlist_qualities", lambda per_item: {})
+    assert cli._choose_playlist_quality([]) is None
+
+
+def test_choose_playlist_quality_shows_one_menu(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "_aggregate_playlist_qualities",
+        lambda per_item: {480: SelectedMediaFormat(480, "", None, 3000)},
+    )
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    height = cli._choose_playlist_quality([
+        {"resolved": {"id": "a"}, "qualities": {480: _selected()}},
+        {"resolved": {"id": "b"}, "qualities": {480: _selected()}},
+    ])
+    assert height == 480
+    assert "Playlist quality" in capsys.readouterr().out
+
+
+def test_choose_playlist_quality_uses_total_not_first_item(monkeypatch, capsys):
+    """The menu must present the aggregated playlist total, not a single item's size."""
+    received = {}
+    monkeypatch.setattr(
+        cli, "_aggregate_playlist_qualities",
+        lambda per_item: {480: SelectedMediaFormat(480, "", None, 9000)},
+    )
+    monkeypatch.setattr(cli, "select_quality", lambda q: received.update(q) or q[480])
+    height = cli._choose_playlist_quality([
+        {"resolved": {"id": "a"}, "qualities": {480: _selected()}},
+        {"resolved": {"id": "b"}, "qualities": {480: _selected()}},
+        {"resolved": {"id": "c"}, "qualities": {480: _selected()}},
+    ])
+    assert height == 480
+    assert received[480].size_bytes == 9000  # the summed playlist total
+    assert "Playlist quality" in capsys.readouterr().out
+
+
+def test_plan_playlist_resolves_and_aggregates_once(monkeypatch):
+    """Planning resolves each entry and computes each item's formats exactly once."""
+    resolutions = []
+    format_calls = []
+
+    def fake_resolve(entry):
+        resolutions.append(entry["id"])
+        return {"id": entry["id"]}
+
+    def fake_select(info):
+        format_calls.append(info["id"])
+        return {480: _selected()}
+
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", fake_resolve)
+    monkeypatch.setattr(cli, "select_formats", fake_select)
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+
+    info = {"entries": [{"id": "v1"}, {"id": "v2"}]}
+    height, per_item = cli._plan_playlist(info)
+
+    assert height == 480
+    assert resolutions == ["v1", "v2"]
+    assert format_calls == ["v1", "v2"]
+    assert [p["resolved"]["id"] for p in per_item] == ["v1", "v2"]
+    assert all(set(p["qualities"]) == {480} for p in per_item)
+
+
+def test_process_playlist_uses_playlist_dir_and_preset_quality(monkeypatch, tmp_path, capsys):
+    """When a height + playlist dir are passed, items use that dir and never re-prompt."""
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    pdir = tmp_path / "My_Playlist"
+    pdir.mkdir()
+
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected(), 720: _selected()})
+    monkeypatch.setattr(cli, "download_media", lambda info, sel, out: (out / f"{info['id']}.mp4").write_bytes(b"d"))
+    monkeypatch.setattr(cli, "find_existing_download", lambda info: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    cli._process_playlist(info, chosen_height=720, playlist_dir=pdir)
+    assert (pdir / "v1.mp4").exists()
+    assert (pdir / "v2.mp4").exists()
+
+
+def test_process_playlist_missing_quality_marks_failed(monkeypatch, tmp_path, capsys):
+    """A selected height unavailable for an item must not download a different quality."""
+    info = _playlist_info(entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    pdir = tmp_path / "My_Playlist"
+    pdir.mkdir()
+
+    def fake_select(i):
+        return {480: _selected()}  # neither item offers the chosen 720p
+
+    monkeypatch.setattr(cli, "select_formats", fake_select)
+    monkeypatch.setattr(cli, "download_media", lambda info, sel, out: pytest.fail("no download on missing quality"))
+    monkeypatch.setattr(cli, "find_existing_download", lambda info: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    stats = _summary(cli._process_playlist(info, chosen_height=720, playlist_dir=pdir))
+    assert stats == {"total": 2, "downloaded": 0, "skipped": 0, "failed": 2, "unresolved": 0}
+    assert "not available" in capsys.readouterr().out
+
+
+def test_run_download_playlist_writes_into_playlist_dir(monkeypatch, tmp_path, data_dir, capsys):
+    """End-to-end: confirmation -> one quality menu -> files in <Playlist>/."""
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "find_existing_download", lambda info: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    def fake_download(entry, selected, output_dir):
+        target = output_dir / f"{entry['id']}.mp4"
+        target.write_bytes(b"d")
+        history.record_download(
+            video_id=entry["id"], title=entry["title"], url=entry["webpage_url"],
+            filename=f"{entry['id']}.mp4", filepath=str(target),
+            quality=selected.height, duration=entry.get("duration"), file_size=1,
+        )
+        return target
+
+    monkeypatch.setattr(cli, "download_media", fake_download)
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+    monkeypatch.setattr(sys, "argv", ["downv"])
+
+    cli._run_download()
+    out = capsys.readouterr().out
+
+    assert "Playlist quality" in out
+    assert "✓ Playlist confirmed" in out
+    assert (tmp_path / "My_Playlist").exists()
+    assert (tmp_path / "My_Playlist" / "v1.mp4").exists()
+    assert (tmp_path / "My_Playlist" / "v2.mp4").exists()
+    assert "Playlist complete" in out
+    # Files must NOT land at the top level
+    assert not (tmp_path / "v1.mp4").exists()
+
+    # History records must point into the playlist directory
+    rec = history.find_download("v1")
+    assert rec is not None
+    assert str(Path(rec["filepath"]).parent) == str(tmp_path / "My_Playlist")
+
+    # No playlist-level history record was created
+    assert history.count_history() == 2
+
+
+def test_run_download_playlist_quality_menued_once(monkeypatch, tmp_path, capsys):
+    """The quality menu must appear exactly once for the whole playlist."""
+    calls = []
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: calls.append(1) or q[480])
+    monkeypatch.setattr(cli, "find_existing_download", lambda info: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda info, sel, out: out / f"{info['id']}.mp4")
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+    monkeypatch.setattr(sys, "argv", ["downv"])
+
+    cli._run_download()
+    assert len(calls) == 1
+    assert capsys.readouterr().out.count("Playlist quality") == 1
+
+
+def test_run_download_playlist_select_formats_once_per_item(monkeypatch, tmp_path, capsys):
+    """The preset-quality path must compute each item's formats exactly once."""
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    format_calls = []
+    monkeypatch.setattr(cli, "select_formats", lambda i: format_calls.append(i["id"]) or {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "find_existing_download", lambda info: None)
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(cli, "download_media", lambda info, sel, out: (out / f"{info['id']}.mp4").write_bytes(b"d"))
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+    monkeypatch.setattr(sys, "argv", ["downv"])
+
+    cli._run_download()
+    assert format_calls == ["v1", "v2"]  # exactly once per item, planning + download reuse the same map
+
+
+def test_run_download_playlist_rerun_detects_already_downloaded(monkeypatch, tmp_path, data_dir, capsys):
+    """Re-running the confirmed playlist finds prior files via history and skips."""
+    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    entry = _resolved("v1", "One")
+    info = _playlist_info(title="My Playlist", entries=[entry])
+    monkeypatch.setattr(cli, "get_media_info", lambda url: info)
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "ffmpeg_available", lambda: True)
+
+    pdir = tmp_path / "My_Playlist"
+    pdir.mkdir()
+    fpath = pdir / "v1.mp4"
+    fpath.write_bytes(b"d")
+    history.record_download(
+        video_id="v1", title="One", url=entry["webpage_url"],
+        filename="v1.mp4", filepath=str(fpath), quality=480, duration=60, file_size=1,
+    )
+
+    monkeypatch.setattr(cli, "download_media", lambda *a, **k: pytest.fail("duplicate must skip download"))
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+    monkeypatch.setattr(sys, "argv", ["downv"])
+
+    cli._run_download()
+    out = capsys.readouterr().out
+    assert "Playlist complete" in out
+    assert "Downloaded : 0" in out
+    assert "Skipped    : 1" in out

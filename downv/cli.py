@@ -1,10 +1,13 @@
 """CLI entry point for DownV."""
 
+import re
 import sys
 import termios
 import tty
 from pathlib import Path
 from typing import Dict
+
+from yt_dlp.utils import sanitize_filename
 
 from downv import history
 from downv.downloader import (
@@ -378,39 +381,13 @@ def _handle_playlist(info: dict) -> bool:
     return answer in ("y", "yes")
 
 
-def _download_video(info: dict) -> str:
-    """Process a single video through the shared download pipeline.
+def _commit_download(info: dict, selected: SelectedMediaFormat, output_dir: Path) -> str:
+    """Run duplicate detection + FFmpeg check + media download for a resolved
+    item using a concrete format and output directory.
 
-    Returns the outcome so playlist orchestration can tally results:
-    ``"downloaded"`` when a new download completed, ``"skipped"`` when
-    duplicate detection found a valid prior download, or ``"failed"`` when
-    the item could not be downloaded for any reason.
+    Shared by standalone and playlist item downloads. Returns the outcome:
+    ``"skipped"`` (already downloaded), ``"failed"``, or ``"downloaded"``.
     """
-    display_info(info)
-
-    qualities = select_formats(info)
-    if not qualities:
-        print("No video formats available.")
-        return "failed"
-
-    print()
-    selected = select_quality(qualities)
-
-    output_dir = Path.home() / "Videos" / "downv"
-    was_missing = not output_dir.exists()
-    try:
-        output_dir = get_output_directory()
-    except OutputDirectoryError as exc:
-        print("✗ Could not create output directory.")
-        print()
-        print(f"Reason: {exc}")
-        return "failed"
-
-    if was_missing:
-        print(f"✓ Created output directory: {output_dir}/")
-    else:
-        print(f"✓ Output directory ready: {output_dir}/")
-
     existing = find_existing_download(info)
     if existing:
         print()
@@ -438,6 +415,51 @@ def _download_video(info: dict) -> str:
     print()
     print("✓ Download completed")
     return "downloaded"
+
+
+def _download_video(
+    info: dict,
+    selected: SelectedMediaFormat | None = None,
+    output_dir: Path | None = None,
+) -> str:
+    """Process a single video through the shared download pipeline.
+
+    If ``selected`` is provided (playlist items using a preselected playlist
+    quality), the per-video quality picker is skipped. If ``output_dir`` is
+    provided (playlist directory), it is used instead of the default output
+    directory. Standalone calls keep their existing interactive behaviour.
+
+    Returns the outcome so playlist orchestration can tally results:
+    ``"downloaded"`` when a new download completed, ``"skipped"`` when
+    duplicate detection found a valid prior download, or ``"failed"`` when
+    the item could not be downloaded for any reason.
+    """
+    display_info(info)
+
+    if selected is None:
+        qualities = select_formats(info)
+        if not qualities:
+            print("No video formats available.")
+            return "failed"
+        print()
+        selected = select_quality(qualities)
+
+    if output_dir is None:
+        output_dir = Path.home() / "Videos" / "downv"
+        was_missing = not output_dir.exists()
+        try:
+            output_dir = get_output_directory()
+        except OutputDirectoryError as exc:
+            print("✗ Could not create output directory.")
+            print()
+            print(f"Reason: {exc}")
+            return "failed"
+        if was_missing:
+            print(f"✓ Created output directory: {output_dir}/")
+        else:
+            print(f"✓ Output directory ready: {output_dir}/")
+
+    return _commit_download(info, selected, output_dir)
 
 
 def _playlist_entry_url(entry: dict) -> str | None:
@@ -493,12 +515,123 @@ def _print_playlist_summary(stats: dict) -> None:
     print(f"  Unresolved : {stats['unresolved']}")
 
 
-def _process_playlist(info: dict) -> dict:
+_MAX_PLAYLIST_DIR_NAME = 120
+
+
+def playlist_dir_name(title: str) -> str:
+    """Return a safe, filesystem-friendly name for a playlist directory.
+
+    Strips invalid characters, collapses whitespace, trims surrounding dots and
+    whitespace, and truncates to a sane maximum. Falls back to ``"Playlist"``
+    when nothing usable remains. The original ``title`` is never mutated.
+    """
+    base = sanitize_filename(title or "", restricted=False) or ""
+    base = base.strip().rstrip(".").replace(" ", "_")
+    base = re.sub(r"__+", "_", base)
+    if not base:
+        return "Playlist"
+    return base[:_MAX_PLAYLIST_DIR_NAME].rstrip("._")
+
+
+def _playlist_output_dir(title: str) -> Path:
+    """Return the dedicated subdirectory for a playlist, creating it if needed.
+
+    Lives under the default output directory so standalone videos are
+    unaffected: ``~/Videos/downv/<Safe Playlist Title>/``.
+    """
+    base = get_output_directory()
+    target = base / playlist_dir_name(title)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OutputDirectoryError(f"{exc.strerror or exc} ({exc.filename or target})") from exc
+    return target
+
+
+def _aggregate_playlist_qualities(per_item: list) -> Dict[int, SelectedMediaFormat]:
+    """Build a playlist-wide quality menu map (one entry per height).
+
+    Consumes the precomputed per-item quality maps from :func:`_plan_playlist`
+    (``per_item``), so ``select_formats`` is computed once per item rather than
+    again here. Each returned :class:`SelectedMediaFormat` carries only the
+    aggregated estimated total size across all resolvable items; format IDs stay
+    blank because the real per-item IDs are looked up from ``per_item`` during
+    download. If any contributing item has an unknown size, that height's total
+    is reported as unknown rather than silently under-reporting.
+    """
+    totals: Dict[int, SelectedMediaFormat] = {}
+    for item in per_item:
+        if not item.get("resolved"):
+            continue
+        for height, fmt in item["qualities"].items():
+            existing = totals.get(height)
+            if existing is None:
+                totals[height] = SelectedMediaFormat(
+                    height, "", None, fmt.size_bytes
+                )
+                continue
+            if existing.size_bytes is None or fmt.size_bytes is None:
+                totals[height] = SelectedMediaFormat(height, "", None, None)
+            else:
+                totals[height] = SelectedMediaFormat(
+                    height, "", None, existing.size_bytes + fmt.size_bytes
+                )
+    return totals
+
+
+def _choose_playlist_quality(per_item: list) -> int | None:
+    """Show a single quality menu for the whole playlist and return the chosen height.
+
+    The menu totals reflect every playlist item, not just the first video. If no
+    resolvable item yields any quality, returns None (no menu displayed).
+    """
+    menu = _aggregate_playlist_qualities(per_item)
+    if not menu:
+        return None
+    print()
+    print("Playlist quality")
+    selected = select_quality(menu)
+    return selected.height
+
+
+def _plan_playlist(info: dict) -> tuple:
+    """Resolve every entry once and compute its per-item quality map.
+
+    Each entry is resolved exactly once and its ``select_formats`` map is
+    computed exactly once. Returns ``(chosen_height_or_None, per_item)`` where
+    ``per_item`` is a list parallel to ``info["entries"]``; each element is a
+    dict with ``"resolved"`` (an info dict or None) and ``"qualities"`` (the
+    ``{height: SelectedMediaFormat}`` map, empty for unresolvable items). The
+    same ``per_item`` list is reused for both menu aggregation and download, so
+    entries and formats are never materialised twice.
+    """
+    per_item = []
+    for entry in info.get("entries") or []:
+        resolved = _resolve_playlist_entry(entry)
+        qualities = select_formats(resolved) if resolved else {}
+        per_item.append({"resolved": resolved, "qualities": qualities})
+    chosen_height = _choose_playlist_quality(per_item)
+    return chosen_height, per_item
+
+
+def _process_playlist(
+    info: dict,
+    chosen_height: int | None = None,
+    playlist_dir: Path | None = None,
+    per_item: list | None = None,
+) -> dict:
     """Download every playlist entry sequentially via the single-video pipeline.
 
     Entries are processed one at a time; malformed or unresolvable entries are
     reported and skipped without stopping the remaining playlist. A summary is
     printed once all entries have been iterated. Returns the tally dict.
+
+    When ``chosen_height``, ``playlist_dir`` and ``per_item`` are provided
+    (from the planning phase in :func:`_run_download`), every item is
+    downloaded into the dedicated playlist directory using that single
+    preselected quality instead of prompting per item. ``per_item`` holds the
+    already-resolved entry info and its precomputed quality map, so neither
+    entries nor ``select_formats`` are recomputed here.
     """
     stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
     entries = info.get("entries") or []
@@ -507,7 +640,12 @@ def _process_playlist(info: dict) -> dict:
         print(f"Playlist item {number}")
         entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
         print(f"  Title : {entry_title}")
-        resolved = _resolve_playlist_entry(entry)
+        if per_item is not None:
+            resolved = per_item[number - 1]["resolved"]
+            item_qualities = per_item[number - 1]["qualities"]
+        else:
+            resolved = _resolve_playlist_entry(entry)
+            item_qualities = None
         if resolved is None:
             stats["unresolved"] += 1
             print()
@@ -516,7 +654,18 @@ def _process_playlist(info: dict) -> dict:
             continue
         print()
         try:
-            outcome = _download_video(resolved)
+            if chosen_height is not None:
+                if item_qualities is None:
+                    item_qualities = select_formats(resolved)
+                selected = item_qualities.get(chosen_height)
+                if selected is None:
+                    stats["failed"] += 1
+                    print(f"  Quality {chosen_height}p not available for this item.")
+                    print()
+                    continue
+                outcome = _download_video(resolved, selected=selected, output_dir=playlist_dir)
+            else:
+                outcome = _download_video(resolved)
             stats[outcome] += 1
         except Exception as exc:
             stats["failed"] += 1
@@ -548,7 +697,18 @@ def _run_download() -> None:
             print()
             print("✓ Playlist confirmed")
             print()
-            _process_playlist(info)
+            title = info.get("title") or info.get("playlist_title") or info.get("id") or "Playlist"
+            chosen_height, per_item = _plan_playlist(info)
+            try:
+                playlist_dir = _playlist_output_dir(title)
+            except OutputDirectoryError as exc:
+                print("✗ Could not create playlist directory.")
+                print()
+                print(f"Reason: {exc}")
+                return
+            print(f"✓ Playlist directory ready: {playlist_dir}/")
+            print()
+            _process_playlist(info, chosen_height=chosen_height, playlist_dir=playlist_dir, per_item=per_item)
         else:
             print()
             print("Download cancelled.")
