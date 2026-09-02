@@ -1013,13 +1013,14 @@ def _process_playlist(
     return stats
 
 
-def _run_download(base: Path | None = None) -> None:
+def _run_download(base: Path | None = None, url: str | None = None) -> None:
     print("DownV - Media Downloader")
     print()
-    url = prompt_for_url()
     if url is None:
-        _menu_cancelled()
-        return
+        url = prompt_for_url()
+        if url is None:
+            _menu_cancelled()
+            return
     print()
     print("Fetching media information...")
 
@@ -1079,7 +1080,7 @@ def _run_download(base: Path | None = None) -> None:
     _download_video(info, output_dir=out_dir)
 
 
-def _main() -> None:
+def _main() -> int | None:
     args = sys.argv[1:]
 
     base = None
@@ -1088,13 +1089,17 @@ def _main() -> None:
     while i < len(args):
         arg = args[i]
         if arg == "--output":
-            if i + 1 >= len(args):
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
                 print("Error: --output requires a directory path")
-                return
+                return 1
             base = resolve_output_directory(args[i + 1])
             i += 2
         elif arg.startswith("--output="):
-            base = resolve_output_directory(arg.split("=", 1)[1])
+            value = arg.split("=", 1)[1]
+            if not value:
+                print("Error: --output requires a directory path")
+                return 1
+            base = resolve_output_directory(value)
             i += 1
         else:
             remaining.append(arg)
@@ -1131,20 +1136,15 @@ def _main() -> None:
             show_history()
         return
 
-    if remaining:
-        print(f"Unknown command: {remaining[0]}")
+    if len(remaining) > 1:
+        print(f"Error: unexpected extra arguments: {' '.join(remaining[1:])}")
         print()
         print("Usage:")
-        print("  downv                       Download a video interactively")
-        print("  downv history               Show download history")
-        print("  downv history <id>          Show details for one video")
-        print("  downv history remove <id>   Remove a history record (metadata only)")
-        print("  downv history clear         Clear all history records (metadata only)")
-        print("  downv history search <q>    Search history by title or video ID")
-        print("  downv history count         Show number of recorded downloads")
-        print("  downv --output <dir>        Download into a custom base directory")
-        return
-    _run_download(base)
+        print("  downv [--output <dir>] [URL]   Download a single video (URL optional)")
+        return 1
+
+    url = remaining[0] if remaining else None
+    _run_download(base, url)
 
 
 def main() -> int:
@@ -1156,8 +1156,8 @@ def main() -> int:
     facing messages instead of raw Python tracebacks.
     """
     try:
-        _main()
-        return 0
+        result = _main()
+        return result if isinstance(result, int) else 0
     except KeyboardInterrupt:
         print()
         print("Download cancelled.")

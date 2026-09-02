@@ -67,8 +67,11 @@ def test_unknown_command_prints_usage(data_dir, capsys, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["downv", "bogus"])
     cli.main()
     out = capsys.readouterr().out
-    assert "Unknown command: bogus" in out
-    assert "downv history" in out
+    # A single positional argument is treated as a download URL in Step 8.4,
+    # not as a subcommand, so it does not trigger the "Unknown command" usage
+    # path. (Multiple positionals are rejected separately.)
+    assert "Unknown command: bogus" not in out
+    assert "downv history" not in out
 
 
 def test_history_subcommand_dispatches(data_dir, monkeypatch, capsys):
