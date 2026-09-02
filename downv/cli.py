@@ -447,12 +447,26 @@ def _handle_playlist(info: dict) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def _ask_preserve_chapters(prompt: str) -> bool:
+    """Ask the user whether to preserve chapters, returning True/False.
+
+    Follows the existing yes/no convention used by ``_handle_playlist``:
+    ``y``/``yes`` (any case) means True; anything else (``n``, empty, or EOF)
+    means False. A defunct/EOF stdin yields False with no traceback.
+    """
+    answer = _read_line(prompt)
+    if answer is None:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 def _commit_download(
     info: dict,
     selected: SelectedMediaFormat,
     output_dir: Path,
     failed_reason: list | None = None,
     verbose: bool = False,
+    preserve_chapters: bool = False,
 ) -> str:
     """Run duplicate detection + FFmpeg check + media download for a resolved
     item using a concrete format and output directory.
@@ -483,7 +497,10 @@ def _commit_download(
     print("Starting download...")
     print()
     try:
-        download_media(info, selected, output_dir)
+        if preserve_chapters:
+            download_media(info, selected, output_dir, preserve_chapters=True)
+        else:
+            download_media(info, selected, output_dir)
     except DownloadFailure as exc:
         print("✗ Download failed.")
         print()
@@ -504,6 +521,7 @@ def _download_video(
     output_dir: Path | None = None,
     failed_reason: list | None = None,
     verbose: bool = False,
+    preserve_chapters: bool = False,
 ) -> str:
     """Process a single video through the shared download pipeline.
 
@@ -557,7 +575,7 @@ def _download_video(
 
     if verbose and selected is not None:
         _debug(f"Selected quality: {selected.height}p", verbose)
-    return _commit_download(info, selected, output_dir, failed_reason, verbose)
+    return _commit_download(info, selected, output_dir, failed_reason, verbose, preserve_chapters)
 
 
 def _playlist_entry_url(entry: dict) -> str | None:
@@ -774,6 +792,7 @@ def _process_items(
     label: str,
     known_count: int | None = None,
     verbose: bool = False,
+    preserve_chapters: bool = False,
 ) -> tuple:
     """Process a collection of playlist item descriptors through the shared pipeline.
 
@@ -850,15 +869,29 @@ def _process_items(
                         )
                         continue
                     if verbose:
-                        outcome = _download_video(
-                            resolved, selected=selected, output_dir=playlist_dir,
-                            failed_reason=failed_reason, verbose=verbose,
-                        )
+                        if preserve_chapters:
+                            outcome = _download_video(
+                                resolved, selected=selected, output_dir=playlist_dir,
+                                failed_reason=failed_reason, verbose=verbose,
+                                preserve_chapters=preserve_chapters,
+                            )
+                        else:
+                            outcome = _download_video(
+                                resolved, selected=selected, output_dir=playlist_dir,
+                                failed_reason=failed_reason, verbose=verbose,
+                            )
                     else:
-                        outcome = _download_video(
-                            resolved, selected=selected, output_dir=playlist_dir,
-                            failed_reason=failed_reason,
-                        )
+                        if preserve_chapters:
+                            outcome = _download_video(
+                                resolved, selected=selected, output_dir=playlist_dir,
+                                failed_reason=failed_reason,
+                                preserve_chapters=preserve_chapters,
+                            )
+                        else:
+                            outcome = _download_video(
+                                resolved, selected=selected, output_dir=playlist_dir,
+                                failed_reason=failed_reason,
+                            )
                     if outcome == "failed":
                         reason = failed_reason[0].strip() if failed_reason else "Download failed."
                         failed_items.append(
@@ -886,9 +919,15 @@ def _process_items(
                     stats[outcome] += 1
                 else:
                     if verbose:
-                        outcome = _download_video(resolved, verbose=verbose)
+                        if preserve_chapters:
+                            outcome = _download_video(resolved, verbose=verbose, preserve_chapters=preserve_chapters)
+                        else:
+                            outcome = _download_video(resolved, verbose=verbose)
                     else:
-                        outcome = _download_video(resolved)
+                        if preserve_chapters:
+                            outcome = _download_video(resolved, preserve_chapters=preserve_chapters)
+                        else:
+                            outcome = _download_video(resolved)
                     if outcome == "failed":
                         failed_items.append(
                             {
@@ -972,6 +1011,7 @@ def _run_with_retries(
     playlist_dir: Path | None,
     known_count: int | None = None,
     verbose: bool = False,
+    preserve_chapters: bool = False,
 ) -> None:
     """Run the initial playlist pass, then offer explicit retries for pending items.
 
@@ -986,7 +1026,8 @@ def _run_with_retries(
     for a playlist of unknown size, so no fabricated total is shown).
     """
     stats, failed, skipped, unresolved = _process_items(
-        items, chosen_height, playlist_dir, "Playlist item", known_count, verbose=verbose
+        items, chosen_height, playlist_dir, "Playlist item", known_count,
+        verbose=verbose, preserve_chapters=preserve_chapters,
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
     round_no = 1
@@ -1003,7 +1044,8 @@ def _run_with_retries(
         print("Retrying failed/unresolved items...")
         _debug(f"Retry round: {round_no} ({len(retry_items)} item(s))", verbose)
         stats, failed, skipped, unresolved = _process_items(
-            retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items), verbose=verbose
+            retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items),
+            verbose=verbose, preserve_chapters=preserve_chapters,
         )
         _print_retry_summary(stats)
         round_no += 1
@@ -1015,6 +1057,7 @@ def _process_playlist(
     playlist_dir: Path | None = None,
     per_item: list | None = None,
     verbose: bool = False,
+    preserve_chapters: bool = False,
 ) -> dict:
     """Download every playlist entry sequentially via the single-video pipeline.
 
@@ -1031,7 +1074,8 @@ def _process_playlist(
     """
     items = _build_playlist_items(info, per_item)
     stats, failed, skipped, unresolved = _process_items(
-        items, chosen_height, playlist_dir, "Playlist item", _safe_playlist_count(info), verbose=verbose
+        items, chosen_height, playlist_dir, "Playlist item", _safe_playlist_count(info),
+        verbose=verbose, preserve_chapters=preserve_chapters,
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
     return stats
@@ -1043,7 +1087,12 @@ def _debug(message: str, verbose: bool) -> None:
         print(f"[DEBUG] {message}")
 
 
-def _run_download(base: Path | None = None, url: str | None = None, verbose: bool = False) -> None:
+def _run_download(
+    base: Path | None = None,
+    url: str | None = None,
+    verbose: bool = False,
+    preserve_chapters: bool = False,
+) -> None:
     print("DownV - Media Downloader")
     _debug("Verbose mode enabled", verbose)
     print()
@@ -1081,6 +1130,11 @@ def _run_download(base: Path | None = None, url: str | None = None, verbose: boo
                 print("Download cancelled.")
                 return
             _debug(f"Selected quality: {chosen_height}p", verbose)
+            chapters = [r["resolved"] for r in per_item if r.get("resolved")]
+            if any(r.get("chapters") for r in chapters):
+                preserve_chapters = _ask_preserve_chapters(
+                    "\nDownload chapters for videos that have them? [y/N]: "
+                )
             try:
                 playlist_dir = _playlist_output_dir(title, base)
             except OutputDirectoryError as exc:
@@ -1097,6 +1151,7 @@ def _run_download(base: Path | None = None, url: str | None = None, verbose: boo
                 playlist_dir=playlist_dir,
                 known_count=_safe_playlist_count(info),
                 verbose=verbose,
+                preserve_chapters=preserve_chapters,
             )
         else:
             print()
@@ -1118,7 +1173,9 @@ def _run_download(base: Path | None = None, url: str | None = None, verbose: boo
     else:
         print(f"✓ Output directory ready: {out_dir}/")
     print()
-    _download_video(info, output_dir=out_dir, verbose=verbose)
+    if info.get("chapters"):
+        preserve_chapters = _ask_preserve_chapters("\nDownload chapters? [y/N]: ")
+    _download_video(info, output_dir=out_dir, verbose=verbose, preserve_chapters=preserve_chapters)
 
 
 def _main() -> int | None:

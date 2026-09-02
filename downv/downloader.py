@@ -110,8 +110,14 @@ def _resolve_unique_base(title: str, output_dir: Path) -> str:
     return candidate
 
 
-def _make_options(url: str, selected: SelectedMediaFormat, output_dir: Path, base: str) -> dict:
-    return {
+def _make_options(
+    url: str,
+    selected: SelectedMediaFormat,
+    output_dir: Path,
+    base: str,
+    preserve_chapters: bool = False,
+) -> dict:
+    options = {
         "format": selected.format_selector,
         "outtmpl": str(output_dir / f"{base}.%(ext)s"),
         "merge_output_format": "mp4",
@@ -120,6 +126,16 @@ def _make_options(url: str, selected: SelectedMediaFormat, output_dir: Path, bas
         "noprogress": False,
         "quiet": False,
     }
+    if preserve_chapters:
+        options["postprocessors"] = [
+            {
+                "key": "FFmpegMetadata",
+                "add_metadata": False,
+                "add_chapters": True,
+                "add_infojson": False,
+            }
+        ]
+    return options
 
 
 def _record(info: dict, selected: SelectedMediaFormat, result: Path) -> None:
@@ -139,8 +155,14 @@ def _record(info: dict, selected: SelectedMediaFormat, result: Path) -> None:
         print(f"Warning: {exc}")
 
 
-def _download(url: str, selected: SelectedMediaFormat, output_dir: Path, base: str) -> None:
-    options = _make_options(url, selected, output_dir, base)
+def _download(
+    url: str,
+    selected: SelectedMediaFormat,
+    output_dir: Path,
+    base: str,
+    preserve_chapters: bool = False,
+) -> None:
+    options = _make_options(url, selected, output_dir, base, preserve_chapters)
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
@@ -149,13 +171,21 @@ def _download(url: str, selected: SelectedMediaFormat, output_dir: Path, base: s
         raise DownloadFailure(str(reason)) from exc
 
 
-def download_media(info: dict, selected: SelectedMediaFormat, output_dir: Path) -> Path:
+def download_media(
+    info: dict,
+    selected: SelectedMediaFormat,
+    output_dir: Path,
+    preserve_chapters: bool = False,
+) -> Path:
     """Download the media described by ``info`` using the selected formats.
 
     Returns the path to the completed file. If the same video is already
     downloaded (matching history record whose file still exists), the existing
     file is returned and nothing is re-downloaded. A successful download is
     recorded in the download history only after the final file exists.
+
+    When ``preserve_chapters`` is True, yt-dlp's native ``FFmpegMetadata``
+    postprocessor embeds any chapters into the final file after merging.
     """
     url = info.get("webpage_url") or info.get("original_url")
     if not url:
@@ -166,7 +196,7 @@ def download_media(info: dict, selected: SelectedMediaFormat, output_dir: Path) 
         return existing
 
     base = _resolve_unique_base(info.get("title") or "video", output_dir)
-    _download(url, selected, output_dir, base)
+    _download(url, selected, output_dir, base, preserve_chapters)
 
     result = _media_for_base(output_dir, base)
     if result is None:
