@@ -11,6 +11,7 @@ from typing import Dict
 from yt_dlp.utils import sanitize_filename
 
 from downv import history
+from downv import __version__
 from downv.downloader import (
     DownloadFailure,
     download_media,
@@ -1178,8 +1179,60 @@ def _run_download(
     _download_video(info, output_dir=out_dir, verbose=verbose, preserve_chapters=preserve_chapters)
 
 
+HELP_TEXT = """DownV - Media Downloader
+
+Usage:
+  downv [OPTIONS] [URL]
+  downv history <COMMAND>
+
+Options:
+  -h, --help          Show this help message and exit
+  -V, --version       Show version information and exit
+  -v, --verbose       Enable verbose diagnostics
+      --output DIR    Save downloads into DIR
+      --output=DIR    Save downloads into DIR (equivalent to --output DIR)
+
+With no URL, DownV prompts for one. A URL may also be passed directly as a
+positional argument. The --output flag may appear before or after the URL.
+
+History subcommands:
+  history count       Show the number of recorded downloads
+  history search      Search recorded downloads
+  history remove      Remove a recorded video by ID
+  history clear       Clear the download history
+  history detail      Show details for a recorded video
+  history             Show the download history
+
+Exit codes:
+  0  Success / normal cancellation
+  1  Error / invalid usage
+  130 Interrupted with Ctrl+C
+
+Requirements:
+  Python >= 3.10
+  yt-dlp
+  FFmpeg is required when the selected format needs merging
+"""
+
+
+def _print_help() -> None:
+    print(HELP_TEXT, end="")
+
+
+def _print_version() -> None:
+    print(f"DownV {__version__}")
+
+
 def _main() -> int | None:
     args = sys.argv[1:]
+
+    for arg in args:
+        if arg in ("-h", "--help"):
+            _print_help()
+            return 0
+        if arg in ("-V", "--version"):
+            _print_version()
+            return 0
 
     base = None
     verbose = False
