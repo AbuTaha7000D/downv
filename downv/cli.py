@@ -1,5 +1,6 @@
 """CLI entry point for DownV."""
 
+import os
 import re
 import sys
 import termios
@@ -22,7 +23,7 @@ from downv.formats import (
     format_size,
     select_formats,
 )
-from downv.paths import OutputDirectoryError, get_output_directory
+from downv.paths import OutputDirectoryError, get_output_directory, resolve_output_directory
 
 
 class _MenuCancelled(Exception):
@@ -534,11 +535,12 @@ def _download_video(
             return "failed"
 
     if output_dir is None:
-        output_dir = Path.home() / "Videos" / "downv"
+        env_dir = os.environ.get("DOWNV_OUTPUT_DIR")
+        output_dir = (Path(env_dir).expanduser() if env_dir else get_output_directory())
         was_missing = not output_dir.exists()
         try:
-            output_dir = get_output_directory()
-        except OutputDirectoryError as exc:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
             print("✗ Could not create output directory.")
             print()
             print(f"Reason: {exc}")
@@ -649,14 +651,15 @@ def playlist_dir_name(title: str) -> str:
     return base[:_MAX_PLAYLIST_DIR_NAME].rstrip("._")
 
 
-def _playlist_output_dir(title: str) -> Path:
+def _playlist_output_dir(title: str, base: Path | None = None) -> Path:
     """Return the dedicated subdirectory for a playlist, creating it if needed.
 
-    Lives under the default output directory so standalone videos are
-    unaffected: ``~/Videos/downv/<Safe Playlist Title>/``.
+    Lives under the base output directory so standalone videos are unaffected:
+    ``<base>/<Safe Playlist Title>/``. When ``base`` is None the default output
+    directory is used.
     """
-    base = get_output_directory()
-    target = base / playlist_dir_name(title)
+    base_dir = base if base is not None else get_output_directory()
+    target = base_dir / playlist_dir_name(title)
     try:
         target.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1010,7 +1013,7 @@ def _process_playlist(
     return stats
 
 
-def _run_download() -> None:
+def _run_download(base: Path | None = None) -> None:
     print("DownV - Media Downloader")
     print()
     url = prompt_for_url()
@@ -1041,7 +1044,7 @@ def _run_download() -> None:
                 print("Download cancelled.")
                 return
             try:
-                playlist_dir = _playlist_output_dir(title)
+                playlist_dir = _playlist_output_dir(title, base)
             except OutputDirectoryError as exc:
                 print("✗ Could not create playlist directory.")
                 print()
@@ -1060,43 +1063,76 @@ def _run_download() -> None:
             print("Download cancelled.")
         return
 
-    _download_video(info)
+    try:
+        out_dir = base if base is not None else resolve_output_directory()
+    except OutputDirectoryError as exc:
+        print("✗ Could not create output directory.")
+        print()
+        print(f"Reason: {exc}")
+        return
+    was_missing = not out_dir.exists()
+    if was_missing:
+        print(f"✓ Created output directory: {out_dir}/")
+    else:
+        print(f"✓ Output directory ready: {out_dir}/")
+    print()
+    _download_video(info, output_dir=out_dir)
 
 
 def _main() -> None:
     args = sys.argv[1:]
-    if args and args[0] == "history":
-        if len(args) >= 2 and args[1] == "remove":
-            if len(args) >= 3:
-                remove_history(args[2])
+
+    base = None
+    remaining = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--output":
+            if i + 1 >= len(args):
+                print("Error: --output requires a directory path")
+                return
+            base = resolve_output_directory(args[i + 1])
+            i += 2
+        elif arg.startswith("--output="):
+            base = resolve_output_directory(arg.split("=", 1)[1])
+            i += 1
+        else:
+            remaining.append(arg)
+            i += 1
+
+    if remaining and remaining[0] == "history":
+        if len(remaining) >= 2 and remaining[1] == "remove":
+            if len(remaining) >= 3:
+                remove_history(remaining[2])
             else:
                 print("Usage: downv history remove <video_id>")
             return
-        if len(args) >= 2 and args[1] == "clear":
-            if len(args) >= 3:
+        if len(remaining) >= 2 and remaining[1] == "clear":
+            if len(remaining) >= 3:
                 print("Usage: downv history clear")
             else:
                 clear_history()
             return
-        if len(args) >= 2 and args[1] == "search":
-            if len(args) >= 3:
-                search_history(args[2])
+        if len(remaining) >= 2 and remaining[1] == "search":
+            if len(remaining) >= 3:
+                search_history(remaining[2])
             else:
                 print("Usage: downv history search <query>")
             return
-        if len(args) >= 2 and args[1] == "count":
-            if len(args) >= 3:
+        if len(remaining) >= 2 and remaining[1] == "count":
+            if len(remaining) >= 3:
                 print("Usage: downv history count")
             else:
                 show_history_count()
             return
-        if len(args) >= 2:
-            show_history_detail(args[1])
+        if len(remaining) >= 2:
+            show_history_detail(remaining[1])
         else:
             show_history()
         return
-    if args:
-        print(f"Unknown command: {args[0]}")
+
+    if remaining:
+        print(f"Unknown command: {remaining[0]}")
         print()
         print("Usage:")
         print("  downv                       Download a video interactively")
@@ -1106,8 +1142,9 @@ def _main() -> None:
         print("  downv history clear         Clear all history records (metadata only)")
         print("  downv history search <q>    Search history by title or video ID")
         print("  downv history count         Show number of recorded downloads")
+        print("  downv --output <dir>        Download into a custom base directory")
         return
-    _run_download()
+    _run_download(base)
 
 
 def main() -> int:
