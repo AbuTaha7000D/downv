@@ -452,6 +452,7 @@ def _commit_download(
     selected: SelectedMediaFormat,
     output_dir: Path,
     failed_reason: list | None = None,
+    verbose: bool = False,
 ) -> str:
     """Run duplicate detection + FFmpeg check + media download for a resolved
     item using a concrete format and output directory.
@@ -487,6 +488,7 @@ def _commit_download(
         print("✗ Download failed.")
         print()
         print(f"Reason: {exc}")
+        _debug(f"Download error: {exc}", verbose)
         if failed_reason is not None:
             failed_reason.append(str(exc).strip() or "Download failed.")
         return "failed"
@@ -501,6 +503,7 @@ def _download_video(
     selected: SelectedMediaFormat | None = None,
     output_dir: Path | None = None,
     failed_reason: list | None = None,
+    verbose: bool = False,
 ) -> str:
     """Process a single video through the shared download pipeline.
 
@@ -552,7 +555,9 @@ def _download_video(
         else:
             print(f"✓ Output directory ready: {output_dir}/")
 
-    return _commit_download(info, selected, output_dir, failed_reason)
+    if verbose and selected is not None:
+        _debug(f"Selected quality: {selected.height}p", verbose)
+    return _commit_download(info, selected, output_dir, failed_reason, verbose)
 
 
 def _playlist_entry_url(entry: dict) -> str | None:
@@ -768,6 +773,7 @@ def _process_items(
     playlist_dir: Path | None,
     label: str,
     known_count: int | None = None,
+    verbose: bool = False,
 ) -> tuple:
     """Process a collection of playlist item descriptors through the shared pipeline.
 
@@ -843,9 +849,16 @@ def _process_items(
                             }
                         )
                         continue
-                    outcome = _download_video(
-                        resolved, selected=selected, output_dir=playlist_dir, failed_reason=failed_reason
-                    )
+                    if verbose:
+                        outcome = _download_video(
+                            resolved, selected=selected, output_dir=playlist_dir,
+                            failed_reason=failed_reason, verbose=verbose,
+                        )
+                    else:
+                        outcome = _download_video(
+                            resolved, selected=selected, output_dir=playlist_dir,
+                            failed_reason=failed_reason,
+                        )
                     if outcome == "failed":
                         reason = failed_reason[0].strip() if failed_reason else "Download failed."
                         failed_items.append(
@@ -872,7 +885,10 @@ def _process_items(
                     stats["total"] += 1
                     stats[outcome] += 1
                 else:
-                    outcome = _download_video(resolved)
+                    if verbose:
+                        outcome = _download_video(resolved, verbose=verbose)
+                    else:
+                        outcome = _download_video(resolved)
                     if outcome == "failed":
                         failed_items.append(
                             {
@@ -951,7 +967,11 @@ def _print_retry_summary(stats: dict) -> None:
 
 
 def _run_with_retries(
-    items: list, chosen_height: int | None, playlist_dir: Path | None, known_count: int | None = None
+    items: list,
+    chosen_height: int | None,
+    playlist_dir: Path | None,
+    known_count: int | None = None,
+    verbose: bool = False,
 ) -> None:
     """Run the initial playlist pass, then offer explicit retries for pending items.
 
@@ -966,9 +986,10 @@ def _run_with_retries(
     for a playlist of unknown size, so no fabricated total is shown).
     """
     stats, failed, skipped, unresolved = _process_items(
-        items, chosen_height, playlist_dir, "Playlist item", known_count
+        items, chosen_height, playlist_dir, "Playlist item", known_count, verbose=verbose
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
+    round_no = 1
     while failed or unresolved:
         pending = sorted(failed + unresolved, key=lambda d: d["index"])
         answer = _read_line("\nRetry failed/unresolved items? [y/N]: ")
@@ -980,10 +1001,12 @@ def _run_with_retries(
         ]
         print()
         print("Retrying failed/unresolved items...")
+        _debug(f"Retry round: {round_no} ({len(retry_items)} item(s))", verbose)
         stats, failed, skipped, unresolved = _process_items(
-            retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items)
+            retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items), verbose=verbose
         )
         _print_retry_summary(stats)
+        round_no += 1
 
 
 def _process_playlist(
@@ -991,6 +1014,7 @@ def _process_playlist(
     chosen_height: int | None = None,
     playlist_dir: Path | None = None,
     per_item: list | None = None,
+    verbose: bool = False,
 ) -> dict:
     """Download every playlist entry sequentially via the single-video pipeline.
 
@@ -1007,20 +1031,30 @@ def _process_playlist(
     """
     items = _build_playlist_items(info, per_item)
     stats, failed, skipped, unresolved = _process_items(
-        items, chosen_height, playlist_dir, "Playlist item", _safe_playlist_count(info)
+        items, chosen_height, playlist_dir, "Playlist item", _safe_playlist_count(info), verbose=verbose
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
     return stats
 
 
-def _run_download(base: Path | None = None, url: str | None = None) -> None:
+def _debug(message: str, verbose: bool) -> None:
+    """Print a single ``[DEBUG]`` diagnostic line when verbose mode is enabled."""
+    if verbose:
+        print(f"[DEBUG] {message}")
+
+
+def _run_download(base: Path | None = None, url: str | None = None, verbose: bool = False) -> None:
     print("DownV - Media Downloader")
+    _debug("Verbose mode enabled", verbose)
     print()
     if url is None:
         url = prompt_for_url()
         if url is None:
             _menu_cancelled()
             return
+        _debug("URL source: interactive", verbose)
+    else:
+        _debug("URL source: command line", verbose)
     print()
     print("Fetching media information...")
 
@@ -1033,17 +1067,20 @@ def _run_download(base: Path | None = None, url: str | None = None) -> None:
         return
 
     if "entries" in info:
+        _debug("Media type: playlist", verbose)
         if _handle_playlist(info):
             print()
             print("✓ Playlist confirmed")
             print()
             title = info.get("title") or info.get("playlist_title") or info.get("id") or "Playlist"
+            _debug(f"Playlist title: {title}", verbose)
             try:
                 chosen_height, per_item = _plan_playlist(info)
             except _MenuCancelled:
                 print()
                 print("Download cancelled.")
                 return
+            _debug(f"Selected quality: {chosen_height}p", verbose)
             try:
                 playlist_dir = _playlist_output_dir(title, base)
             except OutputDirectoryError as exc:
@@ -1051,6 +1088,7 @@ def _run_download(base: Path | None = None, url: str | None = None) -> None:
                 print()
                 print(f"Reason: {exc}")
                 return
+            _debug(f"Output directory: {playlist_dir}", verbose)
             print(f"✓ Playlist directory ready: {playlist_dir}/")
             print()
             _run_with_retries(
@@ -1058,12 +1096,14 @@ def _run_download(base: Path | None = None, url: str | None = None) -> None:
                 chosen_height=chosen_height,
                 playlist_dir=playlist_dir,
                 known_count=_safe_playlist_count(info),
+                verbose=verbose,
             )
         else:
             print()
             print("Download cancelled.")
         return
 
+    _debug("Media type: single video", verbose)
     try:
         out_dir = base if base is not None else resolve_output_directory()
     except OutputDirectoryError as exc:
@@ -1071,19 +1111,21 @@ def _run_download(base: Path | None = None, url: str | None = None) -> None:
         print()
         print(f"Reason: {exc}")
         return
+    _debug(f"Output directory: {out_dir}", verbose)
     was_missing = not out_dir.exists()
     if was_missing:
         print(f"✓ Created output directory: {out_dir}/")
     else:
         print(f"✓ Output directory ready: {out_dir}/")
     print()
-    _download_video(info, output_dir=out_dir)
+    _download_video(info, output_dir=out_dir, verbose=verbose)
 
 
 def _main() -> int | None:
     args = sys.argv[1:]
 
     base = None
+    verbose = False
     remaining = []
     i = 0
     while i < len(args):
@@ -1101,6 +1143,15 @@ def _main() -> int | None:
                 return 1
             base = resolve_output_directory(value)
             i += 1
+        elif arg in ("-v", "--verbose"):
+            verbose = True
+            i += 1
+        elif arg.startswith("-") and arg != "-":
+            print(f"Error: unknown option: {arg}")
+            print()
+            print("Usage:")
+            print("  downv [-v] [--output <dir>] [URL]   Download a single video (URL optional)")
+            return 1
         else:
             remaining.append(arg)
             i += 1
@@ -1140,11 +1191,11 @@ def _main() -> int | None:
         print(f"Error: unexpected extra arguments: {' '.join(remaining[1:])}")
         print()
         print("Usage:")
-        print("  downv [--output <dir>] [URL]   Download a single video (URL optional)")
+        print("  downv [-v] [--output <dir>] [URL]   Download a single video (URL optional)")
         return 1
 
     url = remaining[0] if remaining else None
-    _run_download(base, url)
+    _run_download(base, url, verbose)
 
 
 def main() -> int:
