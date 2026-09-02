@@ -171,8 +171,12 @@ def select_quality(qualities: Dict[int, SelectedMediaFormat]) -> SelectedMediaFo
         rendered_lines = len(lines)
 
     while True:
-        render()
-        key = read_key()
+        try:
+            render()
+            key = read_key()
+        except KeyboardInterrupt:
+            _clear_menu(rendered_lines)
+            raise
         if key in ("EOF", ""):
             _clear_menu(rendered_lines)
             return None
@@ -785,122 +789,132 @@ def _process_items(
     skipped_items = []
     unresolved_items = []
     total = known_count if known_count else None
-    for number, item in enumerate(items, start=1):
-        entry = item["entry"]
-        resolved = item.get("resolved")
-        qualities = item.get("qualities")
-        stats["total"] += 1
-        denominator = f"/{total}" if total else ""
-        print(f"{label} {number}{denominator}")
-        entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
-        print(f"  Title : {entry_title}")
-        if resolved is None:
-            resolved = _resolve_playlist_entry(entry)
-        if resolved is None:
-            stats["unresolved"] += 1
-            print()
-            print(f"✗ Could not resolve playlist item {number}.")
-            print()
-            unresolved_items.append(
-                {
-                    "index": item["index"],
-                    "entry": entry,
-                    "resolved": None,
-                    "qualities": None,
-                    "title": _item_title(None, entry),
-                    "reason": "Could not resolve video information.",
-                }
-            )
-            continue
-        print()
-        failed_reason = []
-        try:
-            if chosen_height is not None:
-                if qualities is None:
-                    qualities = select_formats(resolved)
-                selected = qualities.get(chosen_height)
-                if selected is None:
-                    stats["failed"] += 1
-                    print(f"  Quality {chosen_height}p not available for this item.")
-                    print()
-                    failed_items.append(
-                        {
-                            "index": item["index"],
-                            "entry": entry,
-                            "resolved": resolved,
-                            "qualities": qualities,
-                            "title": _item_title(resolved, entry),
-                            "reason": "Selected quality not available.",
-                        }
-                    )
-                    continue
-                outcome = _download_video(
-                    resolved, selected=selected, output_dir=playlist_dir, failed_reason=failed_reason
+    try:
+        for number, item in enumerate(items, start=1):
+            entry = item["entry"]
+            resolved = item.get("resolved")
+            qualities = item.get("qualities")
+            denominator = f"/{total}" if total else ""
+            print(f"{label} {number}{denominator}")
+            entry_title = entry.get("title", "Unknown") if isinstance(entry, dict) else "Unknown"
+            print(f"  Title : {entry_title}")
+            if resolved is None:
+                resolved = _resolve_playlist_entry(entry)
+            if resolved is None:
+                stats["total"] += 1
+                stats["unresolved"] += 1
+                print()
+                print(f"✗ Could not resolve playlist item {number}.")
+                print()
+                unresolved_items.append(
+                    {
+                        "index": item["index"],
+                        "entry": entry,
+                        "resolved": None,
+                        "qualities": None,
+                        "title": _item_title(None, entry),
+                        "reason": "Could not resolve video information.",
+                    }
                 )
-                if outcome == "failed":
-                    reason = failed_reason[0].strip() if failed_reason else "Download failed."
-                    failed_items.append(
-                        {
-                            "index": item["index"],
-                            "entry": entry,
-                            "resolved": resolved,
-                            "qualities": qualities,
-                            "title": _item_title(resolved, entry),
-                            "reason": reason,
-                        }
-                    )
-                elif outcome == "skipped":
-                    skipped_items.append(
-                        {
-                            "index": item["index"],
-                            "entry": entry,
-                            "resolved": resolved,
-                            "qualities": qualities,
-                            "title": _item_title(resolved, entry),
-                            "reason": "Already downloaded.",
-                        }
-                    )
-                stats[outcome] += 1
-            else:
-                outcome = _download_video(resolved)
-                if outcome == "failed":
-                    failed_items.append(
-                        {
-                            "index": item["index"],
-                            "entry": entry,
-                            "resolved": resolved,
-                            "qualities": qualities,
-                            "title": _item_title(resolved, entry),
-                            "reason": "Download failed.",
-                        }
-                    )
-                elif outcome == "skipped":
-                    skipped_items.append(
-                        {
-                            "index": item["index"],
-                            "entry": entry,
-                            "resolved": resolved,
-                            "qualities": qualities,
-                            "title": _item_title(resolved, entry),
-                            "reason": "Already downloaded.",
-                        }
-                    )
-                stats[outcome] += 1
-        except Exception as exc:
-            stats["failed"] += 1
-            print(f"✗ Failed to download playlist item {number}.")
+                continue
             print()
-            print(f"Reason: {exc}")
-            failed_items.append(
-                {
-                    "index": item["index"],
-                    "entry": entry,
-                    "resolved": resolved,
-                    "qualities": qualities,
-                    "title": _item_title(resolved, entry),
-                    "reason": str(exc).strip() or "Download failed.",
-                }
-            )
+            failed_reason = []
+            try:
+                if chosen_height is not None:
+                    if qualities is None:
+                        qualities = select_formats(resolved)
+                    selected = qualities.get(chosen_height)
+                    if selected is None:
+                        stats["total"] += 1
+                        stats["failed"] += 1
+                        print(f"  Quality {chosen_height}p not available for this item.")
+                        print()
+                        failed_items.append(
+                            {
+                                "index": item["index"],
+                                "entry": entry,
+                                "resolved": resolved,
+                                "qualities": qualities,
+                                "title": _item_title(resolved, entry),
+                                "reason": "Selected quality not available.",
+                            }
+                        )
+                        continue
+                    outcome = _download_video(
+                        resolved, selected=selected, output_dir=playlist_dir, failed_reason=failed_reason
+                    )
+                    if outcome == "failed":
+                        reason = failed_reason[0].strip() if failed_reason else "Download failed."
+                        failed_items.append(
+                            {
+                                "index": item["index"],
+                                "entry": entry,
+                                "resolved": resolved,
+                                "qualities": qualities,
+                                "title": _item_title(resolved, entry),
+                                "reason": reason,
+                            }
+                        )
+                    elif outcome == "skipped":
+                        skipped_items.append(
+                            {
+                                "index": item["index"],
+                                "entry": entry,
+                                "resolved": resolved,
+                                "qualities": qualities,
+                                "title": _item_title(resolved, entry),
+                                "reason": "Already downloaded.",
+                            }
+                        )
+                    stats["total"] += 1
+                    stats[outcome] += 1
+                else:
+                    outcome = _download_video(resolved)
+                    if outcome == "failed":
+                        failed_items.append(
+                            {
+                                "index": item["index"],
+                                "entry": entry,
+                                "resolved": resolved,
+                                "qualities": qualities,
+                                "title": _item_title(resolved, entry),
+                                "reason": "Download failed.",
+                            }
+                        )
+                    elif outcome == "skipped":
+                        skipped_items.append(
+                            {
+                                "index": item["index"],
+                                "entry": entry,
+                                "resolved": resolved,
+                                "qualities": qualities,
+                                "title": _item_title(resolved, entry),
+                                "reason": "Already downloaded.",
+                            }
+                        )
+                    stats["total"] += 1
+                    stats[outcome] += 1
+            except Exception as exc:
+                stats["total"] += 1
+                stats["failed"] += 1
+                print(f"✗ Failed to download playlist item {number}.")
+                print()
+                print(f"Reason: {exc}")
+                failed_items.append(
+                    {
+                        "index": item["index"],
+                        "entry": entry,
+                        "resolved": resolved,
+                        "qualities": qualities,
+                        "title": _item_title(resolved, entry),
+                        "reason": str(exc).strip() or "Download failed.",
+                    }
+                )
+    except KeyboardInterrupt:
+        if stats["total"]:
+            print()
+            _report_playlist_complete(stats, failed_items, skipped_items, unresolved_items)
+        raise
 
     return stats, failed_items, skipped_items, unresolved_items
 
@@ -1049,7 +1063,7 @@ def _run_download() -> None:
     _download_video(info)
 
 
-def main() -> None:
+def _main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "history":
         if len(args) >= 2 and args[1] == "remove":
@@ -1096,5 +1110,25 @@ def main() -> None:
     _run_download()
 
 
+def main() -> int:
+    """Top-level CLI entry point with a graceful error boundary.
+
+    Returns an exit code: ``0`` on success, ``130`` when the user cancels with
+    ``Ctrl+C``, and ``1`` on an unexpected error. This is the single place that
+    turns ``KeyboardInterrupt`` and unexpected exceptions into concise, user
+    facing messages instead of raw Python tracebacks.
+    """
+    try:
+        _main()
+        return 0
+    except KeyboardInterrupt:
+        print()
+        print("Download cancelled.")
+        return 130
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return 1
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

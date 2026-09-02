@@ -1,3 +1,5 @@
+import sys
+
 from downv.cli import main
 
-main()
+sys.exit(main())
