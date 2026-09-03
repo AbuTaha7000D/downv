@@ -200,12 +200,12 @@ def _resolved(vid, title, chapters=None):
 def playlist_pipeline(monkeypatch, tmp_path):
     """Mock the interactive playlist flow so we can drive prompts."""
 
-    def fake_plan_playlist(info):
+    def fake_plan_playlist(info, quality=None):
         per_item = []
         for entry in info["entries"]:
             resolved = {**entry}
             per_item.append({"resolved": resolved, "qualities": {480: _selected()}})
-        return 480, per_item
+        return quality if quality is not None else 480, per_item
 
     def fake_playlist_output_dir(title, base):
         d = tmp_path / "playlist"

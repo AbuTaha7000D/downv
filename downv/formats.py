@@ -138,3 +138,22 @@ def select_formats(info: dict) -> Dict[int, SelectedMediaFormat]:
             )
 
     return result
+
+
+def pick_quality_by_height(
+    qualities: Dict[int, SelectedMediaFormat], height: int
+) -> SelectedMediaFormat | None:
+    """Select the best format for the requested ``height``.
+
+    Returns an exact match when available. Otherwise falls back to the closest
+    height at or below the requested value (e.g. 1080 requested with only 720
+    available returns 720). Returns ``None`` only when ``qualities`` is empty.
+    """
+    if not qualities:
+        return None
+    if height in qualities:
+        return qualities[height]
+    lower = [h for h in qualities if h <= height]
+    if lower:
+        return qualities[max(lower)]
+    return qualities[min(qualities)]

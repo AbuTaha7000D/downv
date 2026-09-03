@@ -22,6 +22,7 @@ from downv.extractor import MediaInfoError, get_media_info
 from downv.formats import (
     SelectedMediaFormat,
     format_size,
+    pick_quality_by_height,
     select_formats,
 )
 from downv.paths import OutputDirectoryError, get_output_directory, resolve_output_directory
@@ -523,6 +524,7 @@ def _download_video(
     failed_reason: list | None = None,
     verbose: bool = False,
     preserve_chapters: bool = False,
+    quality: int | None = None,
 ) -> str:
     """Process a single video through the shared download pipeline.
 
@@ -530,6 +532,10 @@ def _download_video(
     quality), the per-video quality picker is skipped. If ``output_dir`` is
     provided (playlist directory), it is used instead of the default output
     directory. Standalone calls keep their existing interactive behaviour.
+
+    When ``quality`` is provided (non-interactive ``--quality``), the requested
+    height is picked from the available formats automatically without showing
+    the interactive menu.
 
     Returns the outcome so playlist orchestration can tally results:
     ``"downloaded"`` when a new download completed, ``"skipped"`` when
@@ -548,13 +554,21 @@ def _download_video(
             if failed_reason is not None:
                 failed_reason.append("No video formats available.")
             return "failed"
-        print()
-        selected = select_quality(qualities)
-        if selected is None:
-            _menu_cancelled()
-            if failed_reason is not None:
-                failed_reason.append("Download cancelled.")
-            return "failed"
+        if quality is not None:
+            selected = pick_quality_by_height(qualities, quality)
+            if selected is None:
+                print("No video formats available.")
+                if failed_reason is not None:
+                    failed_reason.append("No video formats available.")
+                return "failed"
+        else:
+            print()
+            selected = select_quality(qualities)
+            if selected is None:
+                _menu_cancelled()
+                if failed_reason is not None:
+                    failed_reason.append("Download cancelled.")
+                return "failed"
 
     if output_dir is None:
         env_dir = os.environ.get("DOWNV_OUTPUT_DIR")
@@ -739,7 +753,7 @@ def _choose_playlist_quality(per_item: list) -> int | None:
     return selected.height
 
 
-def _plan_playlist(info: dict) -> tuple:
+def _plan_playlist(info: dict, quality: int | None = None) -> tuple:
     """Resolve every entry once and compute its per-item quality map.
 
     Each entry is resolved exactly once and its ``select_formats`` map is
@@ -749,12 +763,17 @@ def _plan_playlist(info: dict) -> tuple:
     ``{height: SelectedMediaFormat}`` map, empty for unresolvable items). The
     same ``per_item`` list is reused for both menu aggregation and download, so
     entries and formats are never materialised twice.
+
+    When ``quality`` is provided (``--quality``), no interactive menu is shown;
+    the requested height is used directly as the chosen quality.
     """
     per_item = []
     for entry in info.get("entries") or []:
         resolved = _resolve_playlist_entry(entry)
         qualities = select_formats(resolved) if resolved else {}
         per_item.append({"resolved": resolved, "qualities": qualities})
+    if quality is not None:
+        return quality, per_item
     chosen_height = _choose_playlist_quality(per_item)
     return chosen_height, per_item
 
@@ -794,6 +813,7 @@ def _process_items(
     known_count: int | None = None,
     verbose: bool = False,
     preserve_chapters: bool = False,
+    quality_fallback: bool = False,
 ) -> tuple:
     """Process a collection of playlist item descriptors through the shared pipeline.
 
@@ -812,6 +832,11 @@ def _process_items(
     playlist count, which may be unknown/None so no denominator is fabricated;
     a retry passes the size of the retry subset so progress is shown relative
     to it.
+
+    When ``quality_fallback`` is True (non-interactive ``--quality``), an item
+    that lacks the exact requested height falls back to the closest available
+    height at or below it. When False (interactive playlist selection), an item
+    missing the exact chosen height is marked failed as before.
     """
     stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0, "unresolved": 0}
     failed_items = []
@@ -852,7 +877,10 @@ def _process_items(
                 if chosen_height is not None:
                     if qualities is None:
                         qualities = select_formats(resolved)
-                    selected = qualities.get(chosen_height)
+                    if quality_fallback:
+                        selected = pick_quality_by_height(qualities, chosen_height)
+                    else:
+                        selected = qualities.get(chosen_height)
                     if selected is None:
                         stats["total"] += 1
                         stats["failed"] += 1
@@ -1013,6 +1041,7 @@ def _run_with_retries(
     known_count: int | None = None,
     verbose: bool = False,
     preserve_chapters: bool = False,
+    quality_fallback: bool = False,
 ) -> None:
     """Run the initial playlist pass, then offer explicit retries for pending items.
 
@@ -1025,10 +1054,13 @@ def _run_with_retries(
 
     ``known_count`` is the initial run's progress denominator (it may be None
     for a playlist of unknown size, so no fabricated total is shown).
+    ``quality_fallback`` propagates the non-interactive ``--quality`` fallback
+    semantics to the per-item selection.
     """
     stats, failed, skipped, unresolved = _process_items(
         items, chosen_height, playlist_dir, "Playlist item", known_count,
         verbose=verbose, preserve_chapters=preserve_chapters,
+        quality_fallback=quality_fallback,
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
     round_no = 1
@@ -1047,6 +1079,7 @@ def _run_with_retries(
         stats, failed, skipped, unresolved = _process_items(
             retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items),
             verbose=verbose, preserve_chapters=preserve_chapters,
+            quality_fallback=quality_fallback,
         )
         _print_retry_summary(stats)
         round_no += 1
@@ -1059,6 +1092,7 @@ def _process_playlist(
     per_item: list | None = None,
     verbose: bool = False,
     preserve_chapters: bool = False,
+    quality_fallback: bool = False,
 ) -> dict:
     """Download every playlist entry sequentially via the single-video pipeline.
 
@@ -1071,12 +1105,14 @@ def _process_playlist(
     downloaded into the dedicated playlist directory using that single
     preselected quality instead of prompting per item. ``per_item`` holds the
     already-resolved entry info and its precomputed quality map, so neither
-    entries nor ``select_formats`` are recomputed here.
+    entries nor ``select_formats`` are recomputed here. ``quality_fallback``
+    propagates the non-interactive ``--quality`` fallback semantics.
     """
     items = _build_playlist_items(info, per_item)
     stats, failed, skipped, unresolved = _process_items(
         items, chosen_height, playlist_dir, "Playlist item", _safe_playlist_count(info),
         verbose=verbose, preserve_chapters=preserve_chapters,
+        quality_fallback=quality_fallback,
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
     return stats
@@ -1093,9 +1129,12 @@ def _run_download(
     url: str | None = None,
     verbose: bool = False,
     preserve_chapters: bool = False,
+    quality: int | None = None,
 ) -> None:
     print("DownV - Media Downloader")
     _debug("Verbose mode enabled", verbose)
+    if quality is not None:
+        _debug(f"Quality requested: {quality}p", verbose)
     print()
     if url is None:
         url = prompt_for_url()
@@ -1125,7 +1164,7 @@ def _run_download(
             title = info.get("title") or info.get("playlist_title") or info.get("id") or "Playlist"
             _debug(f"Playlist title: {title}", verbose)
             try:
-                chosen_height, per_item = _plan_playlist(info)
+                chosen_height, per_item = _plan_playlist(info, quality)
             except _MenuCancelled:
                 print()
                 print("Download cancelled.")
@@ -1153,6 +1192,7 @@ def _run_download(
                 known_count=_safe_playlist_count(info),
                 verbose=verbose,
                 preserve_chapters=preserve_chapters,
+                quality_fallback=quality is not None,
             )
         else:
             print()
@@ -1176,7 +1216,7 @@ def _run_download(
     print()
     if info.get("chapters"):
         preserve_chapters = _ask_preserve_chapters("\nDownload chapters? [y/N]: ")
-    _download_video(info, output_dir=out_dir, verbose=verbose, preserve_chapters=preserve_chapters)
+    _download_video(info, output_dir=out_dir, verbose=verbose, preserve_chapters=preserve_chapters, quality=quality)
 
 
 HELP_TEXT = """DownV - Media Downloader
@@ -1186,14 +1226,21 @@ Usage:
   downv history <COMMAND>
 
 Options:
-  -h, --help          Show this help message and exit
-  -V, --version       Show version information and exit
-  -v, --verbose       Enable verbose diagnostics
-      --output DIR    Save downloads into DIR
-      --output=DIR    Save downloads into DIR (equivalent to --output DIR)
+  -h, --help              Show this help message and exit
+  -V, --version           Show version information and exit
+  -v, --verbose           Enable verbose diagnostics
+      --output DIR        Save downloads into DIR
+      --output=DIR        Save downloads into DIR (equivalent to --output DIR)
+      --quality HEIGHT    Download at the specified quality (e.g. 1080, 720)
 
 With no URL, DownV prompts for one. A URL may also be passed directly as a
-positional argument. The --output flag may appear before or after the URL.
+positional argument. The --output and --quality flags may appear before or
+after the URL.
+
+When --quality is provided, the interactive quality-selection menu is skipped
+and the requested quality is used automatically. Without --quality the
+interactive menu is shown as before. For playlists, --quality applies the
+same quality to every video.
 
 History subcommands:
   history count       Show the number of recorded downloads
@@ -1236,6 +1283,7 @@ def _main() -> int | None:
 
     base = None
     verbose = False
+    quality = None
     remaining = []
     i = 0
     while i < len(args):
@@ -1253,6 +1301,33 @@ def _main() -> int | None:
                 return 1
             base = resolve_output_directory(value)
             i += 1
+        elif arg == "--quality":
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                print("Error: --quality requires a height value (e.g. --quality 1080)")
+                return 1
+            try:
+                quality = int(args[i + 1])
+            except ValueError:
+                print(f"Error: --quality must be a positive integer, got: {args[i + 1]!r}")
+                return 1
+            if quality <= 0:
+                print(f"Error: --quality must be a positive integer, got: {quality}")
+                return 1
+            i += 2
+        elif arg.startswith("--quality="):
+            value = arg.split("=", 1)[1]
+            if not value:
+                print("Error: --quality requires a height value (e.g. --quality=1080)")
+                return 1
+            try:
+                quality = int(value)
+            except ValueError:
+                print(f"Error: --quality must be a positive integer, got: {value!r}")
+                return 1
+            if quality <= 0:
+                print(f"Error: --quality must be a positive integer, got: {quality}")
+                return 1
+            i += 1
         elif arg in ("-v", "--verbose"):
             verbose = True
             i += 1
@@ -1260,7 +1335,7 @@ def _main() -> int | None:
             print(f"Error: unknown option: {arg}")
             print()
             print("Usage:")
-            print("  downv [-v] [--output <dir>] [URL]   Download a single video (URL optional)")
+            print("  downv [-v] [--output <dir>] [--quality <height>] [URL]   Download a single video (URL optional)")
             return 1
         else:
             remaining.append(arg)
@@ -1301,11 +1376,11 @@ def _main() -> int | None:
         print(f"Error: unexpected extra arguments: {' '.join(remaining[1:])}")
         print()
         print("Usage:")
-        print("  downv [-v] [--output <dir>] [URL]   Download a single video (URL optional)")
+        print("  downv [-v] [--output <dir>] [--quality <height>] [URL]   Download a single video (URL optional)")
         return 1
 
     url = remaining[0] if remaining else None
-    _run_download(base, url, verbose)
+    _run_download(base, url, verbose, quality=quality)
 
 
 def main() -> int:
