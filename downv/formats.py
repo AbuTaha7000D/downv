@@ -33,6 +33,36 @@ class SelectedMediaFormat:
         return self.video_fmt_id
 
 
+@dataclass
+class SelectedAudio:
+    """A concrete audio-only download choice (best available audio stream).
+
+    ``audio_fmt_id`` is the exact yt-dlp format ID to download; the stream is
+    converted to MP3 afterwards. ``size_bytes`` is the estimated stream size.
+    """
+
+    audio_fmt_id: str
+    size_bytes: Optional[float]
+
+    @property
+    def format_selector(self) -> str:
+        return self.audio_fmt_id
+
+
+def select_best_audio(info: dict) -> SelectedAudio | None:
+    """Return the best available audio-only stream for ``info``.
+
+    Picks the single highest-quality audio-only format (by bitrate, then size).
+    Returns ``None`` when the media carries no usable audio-only stream.
+    """
+    formats: List[dict] = info.get("formats") or []
+    audio_only = [f for f in formats if is_audio_only(f)]
+    if not audio_only:
+        return None
+    best = max(audio_only, key=_audio_quality_key)
+    return SelectedAudio(best["format_id"], _format_size_of(best))
+
+
 def format_size(size_bytes: Optional[float]) -> str:
     """Return a human-readable size string, or 'Size unknown' if unknown."""
     if not size_bytes:

@@ -14,6 +14,7 @@ from downv import history
 from downv import __version__
 from downv.downloader import (
     DownloadFailure,
+    download_audio,
     download_media,
     ffmpeg_available,
     find_existing_download,
@@ -23,6 +24,7 @@ from downv.formats import (
     SelectedMediaFormat,
     format_size,
     pick_quality_by_height,
+    select_best_audio,
     select_formats,
 )
 from downv.paths import OutputDirectoryError, get_output_directory, resolve_output_directory
@@ -194,6 +196,61 @@ def select_quality(qualities: Dict[int, SelectedMediaFormat]) -> SelectedMediaFo
             return selected
 
 
+def select_media_type() -> str | None:
+    """Let the user choose between video and audio, returning the choice.
+
+    Returns ``"video"`` or ``"audio"``, or ``None`` when the menu is cancelled
+    (EOF / non-TTY stdin). On non-interactive stdin the menu is skipped and
+    ``"video"`` is returned by default so existing scripted use is unchanged;
+    the interactive Video/Audio choice is only shown on a live terminal.
+    """
+    choices = ["video", "audio"]
+    index = 0
+    rendered_lines = 0
+
+    def render() -> None:
+        nonlocal rendered_lines
+        if rendered_lines:
+            moves = rendered_lines - 1
+            sys.stdout.write(f"\033[{moves}A")
+            for i in range(rendered_lines):
+                sys.stdout.write("\033[2K")
+                if i < rendered_lines - 1:
+                    sys.stdout.write("\n")
+            sys.stdout.write(f"\033[{moves}A")
+        lines = ["Select media type:", ""]
+        for i, choice in enumerate(choices):
+            marker = "❯" if i == index else " "
+            lines.append(f"{marker} {choice.capitalize()}")
+        lines.append("")
+        lines.append("Use ↑/↓ to navigate, Enter to select.")
+        sys.stdout.write("\n".join(lines))
+        sys.stdout.flush()
+        rendered_lines = len(lines)
+
+    if not sys.stdin.isatty():
+        return "video"
+
+    while True:
+        try:
+            render()
+            key = read_key()
+        except KeyboardInterrupt:
+            _clear_menu(rendered_lines)
+            raise
+        if key in ("EOF", ""):
+            _clear_menu(rendered_lines)
+            return None
+        if key == "UP":
+            index = (index - 1) % len(choices)
+        elif key == "DOWN":
+            index = (index + 1) % len(choices)
+        elif key == "ENTER":
+            print()
+            print(f"Selected: {choices[index].capitalize()}")
+            return choices[index]
+
+
 def clear_history() -> None:
     """Clear all download history metadata (never touches media files)."""
     print("DownV - Download History")
@@ -258,9 +315,14 @@ def _file_status(record: dict) -> str:
     return "✓ File exists" if exists else "✗ File missing"
 
 
-def _print_existing(info: dict) -> None:
-    """Print the most recent matching history record for an already-downloaded video."""
-    print("✓ Video already downloaded")
+def _print_existing(info: dict, media_type: str = "video") -> None:
+    """Print the most recent matching history record for an already-downloaded media.
+
+    The header message reflects the detected record's ``media_type`` ("video"
+    or "audio").
+    """
+    label = "Audio" if media_type == "audio" else "Video"
+    print(f"✓ {label} already downloaded")
     video_id = info.get("id")
     if not video_id:
         return
@@ -517,6 +579,66 @@ def _commit_download(
     return "downloaded"
 
 
+def _resolve_media_type(audio: bool, quality: int | None) -> str | None:
+    """Resolve the download media type, or None when an interactive choice is cancelled.
+
+    ``--audio`` forces ``"audio"``; ``--quality`` forces ``"video"``. Otherwise
+    (interactive) the user is offered the Video/Audio selector, which returns
+    ``None`` on cancellation.
+    """
+    if audio:
+        return "audio"
+    if quality is not None:
+        return "video"
+    return select_media_type()
+
+
+def _commit_audio_download(
+    info: dict,
+    selected_audio,
+    output_dir: Path,
+    failed_reason: list | None = None,
+    verbose: bool = False,
+) -> str:
+    """Run duplicate detection + FFmpeg check + audio download for a resolved item.
+
+    Mirrors :func:`_commit_download` for the audio-only path. Returns the
+    outcome: ``"skipped"``, ``"failed"``, or ``"downloaded"``.
+    """
+    existing = find_existing_download(info, media_type="audio")
+    if existing:
+        print()
+        _print_existing(info, media_type="audio")
+        return "skipped"
+
+    if not ffmpeg_available():
+        print()
+        print("✗ FFmpeg is required to extract audio.")
+        print()
+        print("Please install FFmpeg and try again.")
+        if failed_reason is not None:
+            failed_reason.append("FFmpeg is required to extract audio.")
+        return "failed"
+
+    print()
+    print("Starting download...")
+    print()
+    try:
+        download_audio(info, selected_audio, output_dir)
+    except DownloadFailure as exc:
+        print("✗ Download failed.")
+        print()
+        print(f"Reason: {exc}")
+        _debug(f"Download error: {exc}", verbose)
+        if failed_reason is not None:
+            failed_reason.append(str(exc).strip() or "Download failed.")
+        return "failed"
+
+    print()
+    print("✓ Download completed")
+    return "downloaded"
+
+
 def _download_video(
     info: dict,
     selected: SelectedMediaFormat | None = None,
@@ -591,6 +713,51 @@ def _download_video(
     if verbose and selected is not None:
         _debug(f"Selected quality: {selected.height}p", verbose)
     return _commit_download(info, selected, output_dir, failed_reason, verbose, preserve_chapters)
+
+
+def _download_audio(
+    info: dict,
+    selected_audio=None,
+    output_dir: Path | None = None,
+    failed_reason: list | None = None,
+    verbose: bool = False,
+) -> str:
+    """Process a single media through the shared audio download pipeline.
+
+    Picks the best audio stream (MP3) unless a concrete ``selected_audio`` is
+    provided, uses ``output_dir`` when given (playlist directory) or the
+    default otherwise, and returns the outcome: ``"downloaded"``, ``"skipped"``
+    (duplicate detected), or ``"failed"``.
+    """
+    display_info(info)
+
+    if selected_audio is None:
+        selected_audio = select_best_audio(info)
+        if selected_audio is None:
+            print("No audio available for this media.")
+            if failed_reason is not None:
+                failed_reason.append("No audio available.")
+            return "failed"
+
+    if output_dir is None:
+        env_dir = os.environ.get("DOWNV_OUTPUT_DIR")
+        output_dir = (Path(env_dir).expanduser() if env_dir else get_output_directory())
+        was_missing = not output_dir.exists()
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print("✗ Could not create output directory.")
+            print()
+            print(f"Reason: {exc}")
+            if failed_reason is not None:
+                failed_reason.append(str(exc).strip() or "Could not create output directory.")
+            return "failed"
+        if was_missing:
+            print(f"✓ Created output directory: {output_dir}/")
+        else:
+            print(f"✓ Output directory ready: {output_dir}/")
+
+    return _commit_audio_download(info, selected_audio, output_dir, failed_reason, verbose)
 
 
 def _playlist_entry_url(entry: dict) -> str | None:
@@ -778,6 +945,20 @@ def _plan_playlist(info: dict, quality: int | None = None) -> tuple:
     return chosen_height, per_item
 
 
+def _plan_audio_playlist(info: dict) -> list:
+    """Resolve every playlist entry once for an audio-only download.
+
+    Returns the same ``per_item`` shape used by :func:`_plan_playlist` (with an
+    empty quality map) so the shared item pipeline can be reused; there is no
+    quality menu for audio, so every item downloads the best audio stream.
+    """
+    per_item = []
+    for entry in info.get("entries") or []:
+        resolved = _resolve_playlist_entry(entry)
+        per_item.append({"resolved": resolved, "qualities": {}})
+    return per_item
+
+
 def _build_playlist_items(info: dict, per_item: list | None = None) -> list:
     """Build item descriptors (``index``, ``entry``, ``resolved``, ``qualities``).
 
@@ -814,6 +995,7 @@ def _process_items(
     verbose: bool = False,
     preserve_chapters: bool = False,
     quality_fallback: bool = False,
+    media_type: str = "video",
 ) -> tuple:
     """Process a collection of playlist item descriptors through the shared pipeline.
 
@@ -947,7 +1129,18 @@ def _process_items(
                     stats["total"] += 1
                     stats[outcome] += 1
                 else:
-                    if verbose:
+                    if media_type == "audio":
+                        if verbose:
+                            outcome = _download_audio(
+                                resolved, output_dir=playlist_dir,
+                                failed_reason=failed_reason, verbose=verbose,
+                            )
+                        else:
+                            outcome = _download_audio(
+                                resolved, output_dir=playlist_dir,
+                                failed_reason=failed_reason,
+                            )
+                    elif verbose:
                         if preserve_chapters:
                             outcome = _download_video(resolved, verbose=verbose, preserve_chapters=preserve_chapters)
                         else:
@@ -1042,6 +1235,7 @@ def _run_with_retries(
     verbose: bool = False,
     preserve_chapters: bool = False,
     quality_fallback: bool = False,
+    media_type: str = "video",
 ) -> None:
     """Run the initial playlist pass, then offer explicit retries for pending items.
 
@@ -1055,12 +1249,13 @@ def _run_with_retries(
     ``known_count`` is the initial run's progress denominator (it may be None
     for a playlist of unknown size, so no fabricated total is shown).
     ``quality_fallback`` propagates the non-interactive ``--quality`` fallback
-    semantics to the per-item selection.
+    semantics to the per-item selection. ``media_type`` selects the video or
+    audio download pipeline used for every item.
     """
     stats, failed, skipped, unresolved = _process_items(
         items, chosen_height, playlist_dir, "Playlist item", known_count,
         verbose=verbose, preserve_chapters=preserve_chapters,
-        quality_fallback=quality_fallback,
+        quality_fallback=quality_fallback, media_type=media_type,
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
     round_no = 1
@@ -1079,7 +1274,7 @@ def _run_with_retries(
         stats, failed, skipped, unresolved = _process_items(
             retry_items, chosen_height, playlist_dir, "Retry item", len(retry_items),
             verbose=verbose, preserve_chapters=preserve_chapters,
-            quality_fallback=quality_fallback,
+            quality_fallback=quality_fallback, media_type=media_type,
         )
         _print_retry_summary(stats)
         round_no += 1
@@ -1093,6 +1288,7 @@ def _process_playlist(
     verbose: bool = False,
     preserve_chapters: bool = False,
     quality_fallback: bool = False,
+    media_type: str = "video",
 ) -> dict:
     """Download every playlist entry sequentially via the single-video pipeline.
 
@@ -1112,7 +1308,7 @@ def _process_playlist(
     stats, failed, skipped, unresolved = _process_items(
         items, chosen_height, playlist_dir, "Playlist item", _safe_playlist_count(info),
         verbose=verbose, preserve_chapters=preserve_chapters,
-        quality_fallback=quality_fallback,
+        quality_fallback=quality_fallback, media_type=media_type,
     )
     _report_playlist_complete(stats, failed, skipped, unresolved)
     return stats
@@ -1130,11 +1326,14 @@ def _run_download(
     verbose: bool = False,
     preserve_chapters: bool = False,
     quality: int | None = None,
+    audio: bool = False,
 ) -> None:
     print("DownV - Media Downloader")
     _debug("Verbose mode enabled", verbose)
     if quality is not None:
         _debug(f"Quality requested: {quality}p", verbose)
+    if audio:
+        _debug("Audio-only mode enabled", verbose)
     print()
     if url is None:
         url = prompt_for_url()
@@ -1163,6 +1362,32 @@ def _run_download(
             print()
             title = info.get("title") or info.get("playlist_title") or info.get("id") or "Playlist"
             _debug(f"Playlist title: {title}", verbose)
+            media_type = _resolve_media_type(audio, quality)
+            if media_type is None:
+                _menu_cancelled()
+                return
+            _debug(f"Download type: {media_type}", verbose)
+            if media_type == "audio":
+                try:
+                    playlist_dir = _playlist_output_dir(title, base)
+                except OutputDirectoryError as exc:
+                    print("✗ Could not create playlist directory.")
+                    print()
+                    print(f"Reason: {exc}")
+                    return
+                _debug(f"Output directory: {playlist_dir}", verbose)
+                print(f"✓ Playlist directory ready: {playlist_dir}/")
+                print()
+                per_item = _plan_audio_playlist(info)
+                _run_with_retries(
+                    _build_playlist_items(info, per_item),
+                    chosen_height=None,
+                    playlist_dir=playlist_dir,
+                    known_count=_safe_playlist_count(info),
+                    verbose=verbose,
+                    media_type="audio",
+                )
+                return
             try:
                 chosen_height, per_item = _plan_playlist(info, quality)
             except _MenuCancelled:
@@ -1193,6 +1418,7 @@ def _run_download(
                 verbose=verbose,
                 preserve_chapters=preserve_chapters,
                 quality_fallback=quality is not None,
+                media_type="video",
             )
         else:
             print()
@@ -1214,6 +1440,14 @@ def _run_download(
     else:
         print(f"✓ Output directory ready: {out_dir}/")
     print()
+    media_type = _resolve_media_type(audio, quality)
+    if media_type is None:
+        _menu_cancelled()
+        return
+    _debug(f"Download type: {media_type}", verbose)
+    if media_type == "audio":
+        _download_audio(info, output_dir=out_dir, verbose=verbose)
+        return
     if info.get("chapters"):
         preserve_chapters = _ask_preserve_chapters("\nDownload chapters? [y/N]: ")
     _download_video(info, output_dir=out_dir, verbose=verbose, preserve_chapters=preserve_chapters, quality=quality)
@@ -1232,15 +1466,21 @@ Options:
       --output DIR        Save downloads into DIR
       --output=DIR        Save downloads into DIR (equivalent to --output DIR)
       --quality HEIGHT    Download at the specified quality (e.g. 1080, 720)
+      --audio             Download audio only (MP3) instead of video
 
 With no URL, DownV prompts for one. A URL may also be passed directly as a
-positional argument. The --output and --quality flags may appear before or
-after the URL.
+positional argument. The --output, --quality and --audio flags may appear
+before or after the URL.
 
 When --quality is provided, the interactive quality-selection menu is skipped
 and the requested quality is used automatically. Without --quality the
 interactive menu is shown as before. For playlists, --quality applies the
 same quality to every video.
+
+When --audio is provided, audio-only mode is selected immediately and the
+interactive Video/Audio menu is skipped. --audio cannot be combined with
+--quality. In interactive mode (no --audio/--quality) you first choose Video
+or Audio before any quality or chapter prompts.
 
 History subcommands:
   history count       Show the number of recorded downloads
@@ -1284,6 +1524,7 @@ def _main() -> int | None:
     base = None
     verbose = False
     quality = None
+    audio = False
     remaining = []
     i = 0
     while i < len(args):
@@ -1331,11 +1572,14 @@ def _main() -> int | None:
         elif arg in ("-v", "--verbose"):
             verbose = True
             i += 1
+        elif arg == "--audio":
+            audio = True
+            i += 1
         elif arg.startswith("-") and arg != "-":
             print(f"Error: unknown option: {arg}")
             print()
             print("Usage:")
-            print("  downv [-v] [--output <dir>] [--quality <height>] [URL]   Download a single video (URL optional)")
+            print("  downv [-v] [--output <dir>] [--quality <height>] [--audio] [URL]   Download media (URL optional)")
             return 1
         else:
             remaining.append(arg)
@@ -1376,11 +1620,15 @@ def _main() -> int | None:
         print(f"Error: unexpected extra arguments: {' '.join(remaining[1:])}")
         print()
         print("Usage:")
-        print("  downv [-v] [--output <dir>] [--quality <height>] [URL]   Download a single video (URL optional)")
+        print("  downv [-v] [--output <dir>] [--quality <height>] [--audio] [URL]   Download media (URL optional)")
+        return 1
+
+    if audio and quality is not None:
+        print("Error: --audio cannot be combined with --quality")
         return 1
 
     url = remaining[0] if remaining else None
-    _run_download(base, url, verbose, quality=quality)
+    _run_download(base, url, verbose, quality=quality, audio=audio)
 
 
 def main() -> int:

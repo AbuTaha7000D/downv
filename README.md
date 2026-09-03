@@ -4,7 +4,8 @@ DownV is a modern, interactive command-line media downloader built around
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) and FFmpeg. It downloads single
 videos and playlists from the many sites yt-dlp supports, guides you through
 choosing a quality when you want a hand, and lets you pin an exact quality
-non-interactively when you do not.
+non-interactively when you do not. You can also grab just the audio of any
+video as an MP3 with `--audio`.
 
 > **Status:** DownV is under active development. Features are added
 > incrementally milestone by milestone.
@@ -15,6 +16,8 @@ non-interactively when you do not.
   an arrow-key menu.
 - **Non-interactive quality selection** — pick a quality on the command line
   with `--quality`.
+- **Audio-only downloads** — extract the best audio stream as an MP3 with
+  `--audio`.
 - **Single-video and playlist downloads** — the same download pipeline is used
   for both.
 - **Video + audio format handling** — separate video and audio streams are
@@ -39,7 +42,8 @@ non-interactively when you do not.
 - **Python** >= 3.10
 - **yt-dlp** (installed automatically as a Python dependency)
 - **FFmpeg** — required on the system `PATH` when the chosen quality needs
-  video and audio streams merged.
+  video and audio streams merged, and always required for `--audio` downloads
+  (which transcode the audio stream to MP3).
 
 ## Installation
 
@@ -79,8 +83,22 @@ downv "https://www.youtube.com/watch?v=..."
 
 ### Interactive mode
 
-Without `--quality`, DownV fetches the media's available formats and shows an
-arrow-key quality menu:
+In interactive mode (no `--audio` or `--quality`), DownV first asks what kind of
+media to download:
+
+```text
+Select media type:
+
+  ❯ Video
+    Audio
+```
+
+Use `↑`/`↓` and `Enter` to pick. Selecting **Video** continues to the quality
+selection; selecting **Audio** downloads the best audio stream directly (see
+[Audio-only downloads](#audio-only-downloads)).
+
+Without `--quality`, a video download fetches the media's available formats and
+shows an arrow-key quality menu:
 
 ```text
 Available qualities:
@@ -144,6 +162,25 @@ Playlist complete
 
 Failed or unresolved items can be retried from the prompt that follows.
 
+### Audio-only downloads
+
+Pass `--audio` to download only the audio of a video (or playlist), extracted
+to an MP3 using the best available audio stream:
+
+```bash
+downv --audio "https://www.youtube.com/watch?v=..."
+```
+
+`--audio`:
+- selects audio-only mode immediately, skipping the interactive Video/Audio
+  menu and all quality and chapter prompts;
+- works for single videos and playlists (every item becomes an MP3);
+- requires FFmpeg to extract and transcode the audio;
+- cannot be combined with `--quality` (which is a video-height selector).
+
+Audio and video downloads of the same media are tracked separately, so
+downloading a video then its audio is never mistaken for a duplicate.
+
 ### Custom output directory
 
 Force a specific location with `--output`:
@@ -194,6 +231,7 @@ for any videos that have them, and applies that choice to every item.
 | `--output=DIR` | Save downloads into `DIR` (equivalent to `--output DIR`) |
 | `--quality HEIGHT` | Download at the specified height (e.g. 1080, 720); skips the interactive menu |
 | `--quality=HEIGHT` | Equivalent to `--quality HEIGHT` |
+| `--audio` | Download audio only (MP3); cannot be combined with `--quality` |
 
 ### History subcommands
 
@@ -274,8 +312,8 @@ The suite uses `pytest`. From the project root:
 pytest
 ```
 
-The current suite contains **340 tests** covering the CLI, formats, playlists,
-history, chapters, and error handling.
+The current suite contains **366 tests** covering the CLI, formats, playlists,
+history, chapters, audio-only downloads, and error handling.
 
 ### Project Structure
 
@@ -294,11 +332,12 @@ downv/
 DownV is developed in phases. The current release includes all milestones completed through:
 
 - **9.2 — Non-interactive quality selection** (`--quality`)
+- **9.4 — Minimal GitHub Actions CI**
+- **10.1 — Audio-only mode** (`--audio`)
 
 Planned next:
 
-- **9.4 — Minimal GitHub Actions CI**
-- **Phase 10 — Audio-only mode, subtitles, profiles**
+- **Phase 10 — Subtitles, profiles** (remaining parts of Phase 10)
 
 These are direction, not commitments; features land as they are implemented.
 

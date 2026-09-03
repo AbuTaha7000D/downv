@@ -159,18 +159,26 @@ def record_download(
     url: str,
     filename: str,
     filepath: str,
-    quality: int,
+    quality: int | None,
     duration: float | None,
     file_size: int,
+    media_type: str = "video",
 ) -> dict:
     """Record a completed download and return the stored record.
 
     The ``file_size`` (bytes) of the completed media is stored alongside the
     ``downloaded_at`` timestamp so future duplicate checks can tell whether
-    the file on disk still represents this recorded download.
+    the file on disk still represents this recorded download. ``media_type``
+    distinguishes ``"video"`` from ``"audio"`` downloads so the same video's
+    video and audio downloads are tracked independently; ``quality`` is the
+    video height and is ``None`` for audio-only downloads.
 
-    If a record for the same video already exists it is updated in place
-    (one current record per video); otherwise a new record is appended.
+    A record is uniquely identified by its ``video_id`` together with its
+    ``media_type``, so a video download and the audio of the same media are
+    tracked as separate records. Recording the same ``video_id`` + ``media_type``
+    again updates that record in place; otherwise a new record is appended.
+    Records that predate ``media_type`` (missing the field) are treated as
+    ``"video"`` so existing history stays compatible.
     Raises ``HistoryError`` if the current history cannot be preserved (for
     example when an existing file is corrupted) so no metadata is lost.
     """
@@ -180,14 +188,16 @@ def record_download(
         "url": url,
         "filename": filename,
         "filepath": filepath,
-        "quality": int(quality),
+        "quality": int(quality) if quality is not None else None,
         "duration": int(duration) if duration else None,
         "file_size": int(file_size),
+        "media_type": media_type,
         "downloaded_at": datetime.now(timezone.utc).isoformat(),
     }
     downloads = _load()
     for index, existing in enumerate(downloads):
-        if existing.get("video_id") == video_id:
+        existing_media_type = existing.get("media_type", "video")
+        if existing.get("video_id") == video_id and existing_media_type == media_type:
             downloads[index] = record
             break
     else:

@@ -659,3 +659,46 @@ def test_run_download_duplicate_wiring(data_dir, monkeypatch, capsys, tmp_path):
     assert "✓ Video already downloaded" in out
     assert "Wired Duplicate" in out
     assert "Status   : ✓ File exists" in out
+
+
+def test_print_existing_video_message_default(data_dir, capsys):
+    """A video duplicate prints 'Video already downloaded' (default media type)."""
+    record = _make_record("AAA", "Video Duplicate", "2026-01-01T10:00:00+00:00")
+    record["media_type"] = "video"
+    _inject([record])
+
+    cli._print_existing({"id": "AAA"})
+    out = capsys.readouterr().out
+    assert "✓ Video already downloaded" in out
+    assert "✓ Audio already downloaded" not in out
+
+
+def test_print_existing_audio_message(data_dir, capsys):
+    """An audio duplicate prints 'Audio already downloaded'."""
+    record = _make_record("AAA", "Audio Duplicate", "2026-01-01T10:00:00+00:00")
+    record["media_type"] = "audio"
+    record["quality"] = None
+    _inject([record])
+
+    cli._print_existing({"id": "AAA"}, media_type="audio")
+    out = capsys.readouterr().out
+    assert "✓ Audio already downloaded" in out
+    assert "✓ Video already downloaded" not in out
+
+
+def test_commit_audio_download_prints_audio_duplicate(data_dir, monkeypatch, capsys, tmp_path):
+    """End-to-end: audio duplicate detection routes to the audio message."""
+    media = tmp_path / "wired.mp3"
+    media.write_bytes(b"data")
+    record = _make_record("AAA", "Wired Audio", "2026-01-01T10:00:00+00:00")
+    record["media_type"] = "audio"
+    record["quality"] = None
+    record["filepath"] = str(media)
+    _inject([record])
+
+    monkeypatch.setattr(cli, "find_existing_download", lambda info, media_type="video": media)
+    result = cli._commit_audio_download({"id": "AAA", "title": "Wired Audio"}, object(), tmp_path)
+    assert result == "skipped"
+    out = capsys.readouterr().out
+    assert "✓ Audio already downloaded" in out
+    assert "✓ Video already downloaded" not in out

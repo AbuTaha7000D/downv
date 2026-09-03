@@ -60,17 +60,19 @@ def _valid_media_state(record: dict, path: Path) -> bool:
     return size == file_size and mtime <= recorded_epoch.timestamp()
 
 
-def find_existing_download(info: dict) -> Path:
+def find_existing_download(info: dict, media_type: str = "video") -> Path:
     """Return the path of a valid, previously completed download of this video.
 
-    Duplicate detection is based on the YouTube ``video_id`` alone. A record
-    only counts as a duplicate when the file at its recorded path still exists
-    AND still represents that recorded download (see ``_valid_media_state``).
-    Any record whose file was deleted, replaced, modified after the download,
-    or replaced by a manually created placeholder is NOT treated as a
-    duplicate; the caller proceeds to download again.
+    Duplicate detection is based on the YouTube ``video_id`` combined with the
+    ``media_type`` (``"video"`` or ``"audio"``), so a video download and the
+    audio-only version of the same media are never mistaken for each other. A
+    record only counts as a duplicate when the file at its recorded path still
+    exists AND still represents that recorded download (see
+    ``_valid_media_state``). Any record whose file was deleted, replaced,
+    modified after the download, or replaced by a manually created placeholder
+    is NOT treated as a duplicate; the caller proceeds to download again.
 
-    Returns None when no valid prior download of this video exists.
+    Returns None when no valid prior download of this media type exists.
     """
     video_id = info.get("id")
     if not video_id:
@@ -81,6 +83,8 @@ def find_existing_download(info: dict) -> Path:
         print(f"Warning: {exc}")
         return None
     for record in reversed(records):
+        if record.get("media_type", "video") != media_type:
+            continue
         filepath = record.get("filepath")
         if not filepath:
             continue
@@ -138,7 +142,12 @@ def _make_options(
     return options
 
 
-def _record(info: dict, selected: SelectedMediaFormat, result: Path) -> None:
+def _record(
+    info: dict,
+    result: Path,
+    quality: int | None,
+    media_type: str = "video",
+) -> None:
     duration = info.get("duration")
     try:
         history.record_download(
@@ -147,9 +156,10 @@ def _record(info: dict, selected: SelectedMediaFormat, result: Path) -> None:
             url=info.get("webpage_url") or info.get("original_url") or "",
             filename=result.name,
             filepath=str(result),
-            quality=selected.height,
+            quality=quality,
             duration=duration,
             file_size=result.stat().st_size,
+            media_type=media_type,
         )
     except history.HistoryError as exc:
         print(f"Warning: {exc}")
@@ -169,6 +179,70 @@ def _download(
     except DownloadError as exc:
         reason = exc.exc_info[1] if exc.exc_info and exc.exc_info[1] else str(exc)
         raise DownloadFailure(str(reason)) from exc
+
+
+def _make_audio_options(
+    url: str,
+    selected_audio,
+    output_dir: Path,
+    base: str,
+) -> dict:
+    options = {
+        "format": selected_audio.format_selector,
+        "outtmpl": str(output_dir / f"{base}.%(ext)s"),
+        "noplaylist": True,
+        "overwrites": False,
+        "noprogress": False,
+        "quiet": False,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+    }
+    return options
+
+
+def download_audio(
+    info: dict,
+    selected_audio,
+    output_dir: Path,
+) -> Path:
+    """Download the audio of ``info`` as an MP3 using the selected audio stream.
+
+    Returns the path to the completed file. FFmpeg is required to extract and
+    transcode the audio to MP3; a ``DownloadFailure`` is raised when it is not
+    available. Duplicate detection is scoped to audio-only downloads, so a
+    previously downloaded video of the same media never blocks the audio
+    version and vice versa.
+    """
+    url = info.get("webpage_url") or info.get("original_url")
+    if not url:
+        raise DownloadFailure("No downloadable URL available.")
+    if not ffmpeg_available():
+        raise DownloadFailure("FFmpeg is required for audio extraction.")
+
+    existing = find_existing_download(info, media_type="audio")
+    if existing:
+        return existing
+
+    base = _resolve_unique_base(info.get("title") or "video", output_dir)
+    options = _make_audio_options(url, selected_audio, output_dir, base)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+    except DownloadError as exc:
+        reason = exc.exc_info[1] if exc.exc_info and exc.exc_info[1] else str(exc)
+        raise DownloadFailure(str(reason)) from exc
+
+    result = _media_for_base(output_dir, base)
+    if result is None:
+        raise DownloadFailure("Download reported success but no file was found.")
+
+    _record(info, result, quality=None, media_type="audio")
+    return result
 
 
 def download_media(
@@ -202,5 +276,5 @@ def download_media(
     if result is None:
         raise DownloadFailure("Download reported success but no file was found.")
 
-    _record(info, selected, result)
+    _record(info, result, quality=selected.height, media_type="video")
     return result

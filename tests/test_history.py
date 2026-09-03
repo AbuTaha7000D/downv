@@ -171,3 +171,106 @@ def test_count_history(data_dir):
         _make_record("BBB", "Two", "2026-02-01T10:00:00+00:00"),
     ])
     assert history.count_history() == 2
+
+
+# --------------------------------------------------------------------------- #
+# Media-type-aware uniqueness (video_id + media_type)
+# --------------------------------------------------------------------------- #
+
+
+def _record_meta(video_id, media_type="video"):
+    return history.record_download(
+        video_id=video_id,
+        title="T",
+        url=f"https://example.com/{video_id}",
+        filename=f"{video_id}.{'mp3' if media_type == 'audio' else 'mp4'}",
+        filepath=f"/tmp/media/{video_id}",
+        quality=None if media_type == "audio" else 480,
+        duration=10,
+        file_size=1024,
+        media_type=media_type,
+    )
+
+
+def test_record_video_creates_video_record(data_dir):
+    record = _record_meta("AAA", "video")
+    stored = history.find_download("AAA")
+    assert stored["video_id"] == "AAA"
+    assert stored["media_type"] == "video"
+    assert record["media_type"] == "video"
+
+
+def test_record_audio_same_video_creates_second_record(data_dir):
+    _record_meta("AAA", "video")
+    _record_meta("AAA", "audio")
+
+    downloads = history.find_downloads("AAA")
+    assert len(downloads) == 2
+    types = sorted(r["media_type"] for r in downloads)
+    assert types == ["audio", "video"]
+
+
+def test_record_same_video_updates_existing_video_record(data_dir):
+    _record_meta("AAA", "video")
+    _record_meta("AAA", "video")
+
+    downloads = history.find_downloads("AAA")
+    assert len(downloads) == 1
+    assert downloads[0]["media_type"] == "video"
+    assert history.count_history() == 1
+
+
+def test_record_same_audio_updates_existing_audio_record(data_dir):
+    _record_meta("AAA", "audio")
+    _record_meta("AAA", "audio")
+
+    downloads = history.find_downloads("AAA")
+    assert len(downloads) == 1
+    assert downloads[0]["media_type"] == "audio"
+    assert downloads[0]["quality"] is None
+    assert history.count_history() == 1
+
+
+def test_legacy_record_without_media_type_matches_video_update(data_dir):
+    """A legacy record with no media_type is treated as 'video' for updates."""
+    _inject([
+        {
+            "video_id": "AAA",
+            "title": "old",
+            "url": "https://example.com/AAA",
+            "filename": "AAA.mp4",
+            "filepath": "/tmp/media/AAA.mp4",
+            "quality": 480,
+            "duration": 10,
+            "file_size": 1024,
+            "downloaded_at": "2026-01-01T10:00:00+00:00",
+        }
+    ])
+    _record_meta("AAA", "video")
+
+    downloads = history.find_downloads("AAA")
+    assert len(downloads) == 1
+    assert downloads[0]["media_type"] == "video"
+
+
+def test_legacy_record_without_media_type_allows_separate_audio(data_dir):
+    """A legacy record without media_type does not block a fresh audio record."""
+    _inject([
+        {
+            "video_id": "AAA",
+            "title": "T",
+            "url": "https://example.com/AAA",
+            "filename": "AAA.mp4",
+            "filepath": "/tmp/media/AAA.mp4",
+            "quality": 480,
+            "duration": 10,
+            "file_size": 1024,
+            "downloaded_at": "2026-01-01T10:00:00+00:00",
+        }
+    ])
+    _record_meta("AAA", "audio")
+
+    downloads = history.find_downloads("AAA")
+    assert len(downloads) == 2
+    types = sorted(r.get("media_type", "video") for r in downloads)
+    assert types == ["audio", "video"]
