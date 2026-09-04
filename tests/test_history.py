@@ -274,3 +274,21 @@ def test_legacy_record_without_media_type_allows_separate_audio(data_dir):
     assert len(downloads) == 2
     types = sorted(r.get("media_type", "video") for r in downloads)
     assert types == ["audio", "video"]
+
+
+def test_remove_download_removes_all_media_type_records(data_dir):
+    """Remove must clear every record for a video id (video AND audio), not just one.
+
+    Regression for the release review: with audio and video tracked as separate
+    records for the same id, remove used to leave the other type behind.
+    """
+    _record_meta("AAA", "video")
+    _record_meta("AAA", "audio")
+
+    removed = history.remove_download("AAA")
+    assert removed is not None
+    assert history.find_downloads("AAA") == []
+    assert history.count_history() == 0
+    # The other video's record is untouched.
+    _record_meta("BBB", "video")
+    assert history.count_history() == 1

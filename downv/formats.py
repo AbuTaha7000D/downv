@@ -1,7 +1,6 @@
 """Processing of yt-dlp format data for quality selection."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 
 @dataclass
@@ -15,8 +14,8 @@ class SelectedMediaFormat:
 
     height: int
     video_fmt_id: str
-    audio_fmt_id: Optional[str]
-    size_bytes: Optional[float]
+    audio_fmt_id: str | None
+    size_bytes: float | None
 
     @property
     def label(self) -> str:
@@ -42,7 +41,7 @@ class SelectedAudio:
     """
 
     audio_fmt_id: str
-    size_bytes: Optional[float]
+    size_bytes: float | None
 
     @property
     def format_selector(self) -> str:
@@ -55,7 +54,7 @@ def select_best_audio(info: dict) -> SelectedAudio | None:
     Picks the single highest-quality audio-only format (by bitrate, then size).
     Returns ``None`` when the media carries no usable audio-only stream.
     """
-    formats: List[dict] = info.get("formats") or []
+    formats: list[dict] = info.get("formats") or []
     audio_only = [f for f in formats if is_audio_only(f)]
     if not audio_only:
         return None
@@ -63,7 +62,7 @@ def select_best_audio(info: dict) -> SelectedAudio | None:
     return SelectedAudio(best["format_id"], _format_size_of(best))
 
 
-def format_size(size_bytes: Optional[float]) -> str:
+def format_size(size_bytes: float | None) -> str:
     """Return a human-readable size string, or 'Size unknown' if unknown."""
     if not size_bytes:
         return "Size unknown"
@@ -79,7 +78,7 @@ def format_size(size_bytes: Optional[float]) -> str:
     return "Size unknown"
 
 
-def _format_size_of(fmt: dict) -> Optional[float]:
+def _format_size_of(fmt: dict) -> float | None:
     return fmt.get("filesize") or fmt.get("filesize_approx")
 
 
@@ -121,7 +120,7 @@ def is_combined(fmt: dict) -> bool:
     )
 
 
-def select_formats(info: dict) -> Dict[int, SelectedMediaFormat]:
+def select_formats(info: dict) -> dict[int, SelectedMediaFormat]:
     """Unify quality selection into concrete download choices.
 
     For every available video height, pick the best video-only stream at that
@@ -129,7 +128,7 @@ def select_formats(info: dict) -> Dict[int, SelectedMediaFormat]:
     stream when no separate audio exists. The exact format IDs are recorded so
     the downloader reuses the same streams used for the size estimate.
     """
-    formats: List[dict] = info.get("formats") or []
+    formats: list[dict] = info.get("formats") or []
 
     video_only = [f for f in formats if is_video_only(f) and f.get("height")]
     combined = [f for f in formats if is_combined(f) and f.get("height")]
@@ -138,7 +137,7 @@ def select_formats(info: dict) -> Dict[int, SelectedMediaFormat]:
     best_audio = max(audio_only, key=_audio_quality_key, default=None)
 
     heights = sorted({f["height"] for f in video_only + combined}, reverse=True)
-    result: Dict[int, SelectedMediaFormat] = {}
+    result: dict[int, SelectedMediaFormat] = {}
 
     for height in heights:
         vids = [f for f in video_only if f.get("height") == height]
@@ -171,7 +170,7 @@ def select_formats(info: dict) -> Dict[int, SelectedMediaFormat]:
 
 
 def pick_quality_by_height(
-    qualities: Dict[int, SelectedMediaFormat], height: int
+    qualities: dict[int, SelectedMediaFormat], height: int
 ) -> SelectedMediaFormat | None:
     """Select the best format for the requested ``height``.
 

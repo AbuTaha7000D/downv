@@ -2,6 +2,9 @@
 
 import yt_dlp
 
+from downv import downloader
+from downv.downloader import _MutedLogger, _QuietLogger
+
 
 class MediaInfoError(Exception):
     """Raised when media information cannot be retrieved."""
@@ -19,11 +22,17 @@ def get_media_info(url: str) -> dict:
     Downloading item X of Y`` progress chatter during this detection pass.
     Plain (non-playlist) URLs are unaffected because they are not inside a
     playlist ``extra_info`` and therefore are still fully resolved.
+
+    The configured ``logger`` mirrors the download path (see :func:`set_verbose`):
+    normal runs use a muted logger so yt-dlp ``WARNING``/``DEBUG`` lines never
+    leak into regular CLI output, while verbose runs forward them onto the
+    ``downv.downloader`` logger where the CLI surfaces them in ``--verbose``.
     """
     options = {
         "skip_download": True,
         "extract_flat": "in_playlist",
         "quiet": True,
+        "logger": _QuietLogger() if downloader._VERBOSE else _MutedLogger(),
     }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:

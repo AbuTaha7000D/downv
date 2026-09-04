@@ -364,3 +364,24 @@ def test_python_m_downv_no_traceback_on_error(monkeypatch):
     monkeypatch.setattr(cli, "_download_video", _raise_interrupt)
     rc = cli.main()
     assert rc == 130
+
+
+def test_unexpected_exception_traceback_in_verbose(monkeypatch, capsys):
+    """In --verbose mode an unexpected internal error stays debuggable with a traceback."""
+    from downv import downloader
+
+    monkeypatch.setattr(sys, "argv", ["downv", "--verbose"])
+
+    def explode(p):
+        raise RuntimeError("internal boom")
+
+    monkeypatch.setattr("builtins.input", explode)
+    monkeypatch.setattr(cli, "get_media_info", lambda u: {"_type": "video"})
+    try:
+        rc = cli.main()
+    finally:
+        downloader.set_verbose(False)
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error: internal boom" in captured.out
+    assert "Traceback (most recent call last)" in captured.err

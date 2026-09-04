@@ -1002,7 +1002,7 @@ def test_playlist_dir_name_truncates_long_titles(monkeypatch):
 
 
 def test_playlist_output_dir_lives_under_default(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "resolve_output_directory", lambda: tmp_path)
     target = cli._playlist_output_dir("My Playlist")
     assert target == tmp_path / "My_Playlist"
     assert target.exists()
@@ -1010,7 +1010,7 @@ def test_playlist_output_dir_lives_under_default(monkeypatch, tmp_path):
 
 
 def test_playlist_output_dir_exists_ok(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "resolve_output_directory", lambda: tmp_path)
     (tmp_path / "My_Playlist").mkdir()
     target = cli._playlist_output_dir("My Playlist")
     assert target == tmp_path / "My_Playlist"
@@ -1150,7 +1150,7 @@ def test_process_playlist_missing_quality_marks_failed(monkeypatch, tmp_path, ca
 
 def test_run_download_playlist_writes_into_playlist_dir(monkeypatch, tmp_path, data_dir, capsys):
     """End-to-end: confirmation -> one quality menu -> files in <Playlist>/."""
-    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "resolve_output_directory", lambda: tmp_path)
     info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One"), _resolved("v2", "Two")])
     monkeypatch.setattr(cli, "get_media_info", lambda url: info)
     monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
@@ -2096,7 +2096,7 @@ def test_retry_quality_menu_once_and_preserved(monkeypatch, tmp_path, data_dir, 
 
 def test_retry_uses_same_output_directory(monkeypatch, tmp_path, data_dir, capsys):
     """Test 10: retry writes into the same playlist directory."""
-    monkeypatch.setattr(cli, "get_output_directory", lambda: tmp_path)
+    monkeypatch.setattr(cli, "resolve_output_directory", lambda: tmp_path)
     info = _playlist_info(title="My Playlist", entries=[_resolved("v1", "One")])
     monkeypatch.setattr(cli, "get_media_info", lambda url: info)
     monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})

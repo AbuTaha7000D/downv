@@ -1,5 +1,6 @@
 """Video download engine using yt-dlp."""
 
+import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,9 +16,61 @@ class DownloadFailure(Exception):
     """Raised when a download cannot be completed."""
 
 
+_VERBOSE = False
+
+
+def set_verbose(value: bool) -> None:
+    """Enable or disable verbose yt-dlp output for subsequent downloads.
+
+    Kept as simple module state so the public ``download_media``/
+    ``download_audio`` signatures stay stable (they are mocked throughout the
+    test suite). The CLI calls this once at startup based on ``--verbose`` so
+    normal runs stay clean and verbose runs surface yt-dlp diagnostics.
+    """
+    global _VERBOSE
+    _VERBOSE = bool(value)
+
+
 def ffmpeg_available() -> bool:
     """Return True if FFmpeg is available on the system PATH."""
     return shutil.which("ffmpeg") is not None
+
+
+class _QuietLogger:
+    """yt-dlp logger that forwards messages to Python's logging.
+
+    Verbose downloads (see :func:`set_verbose`) use this logger so yt-dlp's own
+    ``[download]``/``[Merger]`` diagnostics surface through Python's
+    ``logging`` (under ``downv.downloader``), where the CLI enables a handler in
+    verbose mode. Normal downloads use :class:`_MutedLogger` instead.
+    """
+
+    def debug(self, msg):
+        logging.getLogger("downv.downloader").debug(msg)
+
+    def warning(self, msg):
+        logging.getLogger("downv.downloader").warning(msg)
+
+    def error(self, msg):
+        logging.getLogger("downv.downloader").error(msg)
+
+
+class _MutedLogger:
+    """yt-dlp logger that discards every message.
+
+    Used in normal (non-verbose) downloads so background framework noise (for
+    example from FFmpeg postprocessors) is never echoed to stdout; DownV prints
+    its own concise progress messages instead.
+    """
+
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
 
 
 def _media_for_base(output_dir: Path, base: str) -> Path:
@@ -127,8 +180,9 @@ def _make_options(
         "merge_output_format": "mp4",
         "noplaylist": True,
         "overwrites": False,
-        "noprogress": False,
-        "quiet": False,
+        "logger": _QuietLogger() if _VERBOSE else _MutedLogger(),
+        "noprogress": not _VERBOSE,
+        "quiet": not _VERBOSE,
     }
     if preserve_chapters:
         options["postprocessors"] = [
@@ -192,8 +246,9 @@ def _make_audio_options(
         "outtmpl": str(output_dir / f"{base}.%(ext)s"),
         "noplaylist": True,
         "overwrites": False,
-        "noprogress": False,
-        "quiet": False,
+        "logger": _QuietLogger() if _VERBOSE else _MutedLogger(),
+        "noprogress": not _VERBOSE,
+        "quiet": not _VERBOSE,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",

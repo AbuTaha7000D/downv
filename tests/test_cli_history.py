@@ -122,6 +122,28 @@ def test_history_detail_subcommand_dispatches(data_dir, monkeypatch, capsys):
     assert captured.get("id") == "AAA"
 
 
+def test_history_detail_documented_form_dispatches_to_id(data_dir, monkeypatch, capsys):
+    """`downv history detail <id>` must resolve the ID, not the literal "detail".
+
+    Regression for the release review: "detail" was previously consumed as the
+    video_id itself, so the documented form always reported "No record found for
+    video ID: detail".
+    """
+    _inject([_make_record("AAA", "Detail Video", "2026-01-01T10:00:00+00:00")])
+    captured = {}
+    monkeypatch.setattr(cli, "show_history_detail", lambda vid: captured.setdefault("id", vid))
+    monkeypatch.setattr(sys, "argv", ["downv", "history", "detail", "AAA"])
+    cli.main()
+    assert captured.get("id") == "AAA"
+
+
+def test_history_detail_missing_id_prints_usage(data_dir, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["downv", "history", "detail"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "Usage: downv history detail <video_id>" in out
+
+
 def test_show_history_detail_uses_find_download_api(data_dir, monkeypatch, capsys):
     """Detail view must resolve via find_download, never parse JSON itself."""
     record = _make_record("AAA", "Detail Video", "2026-01-01T10:00:00+00:00")
@@ -702,3 +724,106 @@ def test_commit_audio_download_prints_audio_duplicate(data_dir, monkeypatch, cap
     out = capsys.readouterr().out
     assert "✓ Audio already downloaded" in out
     assert "✓ Video already downloaded" not in out
+
+
+def test_print_existing_video_shows_video_not_audio(data_dir, capsys):
+    """A video duplicate shows the video record even when a newer audio record exists.
+
+    Regression for Phase 11 finding 1: _print_existing previously used
+    ``records[-1]`` (the most recently stored record of any type), so a video
+    request cross-displayed the audio record for the same ID.
+    """
+    video = _make_record("AAA", "Video Title", "2026-01-01T10:00:00+00:00", quality=720)
+    video["media_type"] = "video"
+    audio = _make_record("AAA", "Audio Title", "2026-02-01T10:00:00+00:00")
+    audio["media_type"] = "audio"
+    audio["quality"] = None
+    _inject([video, audio])  # audio stored after video -> would win records[-1]
+
+    cli._print_existing({"id": "AAA"})
+    out = capsys.readouterr().out
+    assert "✓ Video already downloaded" in out
+    assert "Video Title" in out
+    assert "Audio Title" not in out
+
+
+def test_print_existing_audio_shows_audio_not_video(data_dir, capsys):
+    """An audio duplicate shows the audio record even when a newer video record exists.
+
+    Regression for Phase 11 finding 1: the reverse direction of the selection
+    bug (audio request cross-displaying a video record).
+    """
+    audio = _make_record("AAA", "Audio Title", "2026-01-01T10:00:00+00:00")
+    audio["media_type"] = "audio"
+    audio["quality"] = None
+    video = _make_record("AAA", "Video Title", "2026-02-01T10:00:00+00:00", quality=720)
+    video["media_type"] = "video"
+    _inject([audio, video])  # video stored after audio -> would win records[-1]
+
+    cli._print_existing({"id": "AAA"}, media_type="audio")
+    out = capsys.readouterr().out
+    assert "✓ Audio already downloaded" in out
+    assert "Audio Title" in out
+    assert "Video Title" not in out
+
+
+def test_print_existing_missing_media_type_record_is_video(data_dir, capsys):
+    """Records without a media_type field are treated as video (legacy default)."""
+    legacy = _make_record("AAA", "Legacy Video", "2026-01-01T10:00:00+00:00")
+    audio = _make_record("AAA", "Audio Title", "2026-02-01T10:00:00+00:00")
+    audio["media_type"] = "audio"
+    audio["quality"] = None
+    _inject([legacy, audio])
+
+    cli._print_existing({"id": "AAA"})
+    out = capsys.readouterr().out
+    assert "✓ Video already downloaded" in out
+    assert "Legacy Video" in out
+
+
+def test_print_existing_no_matching_media_type_falls_back_to_header(data_dir, capsys):
+    """When no record of the requested media type exists, the header is printed."""
+    video = _make_record("AAA", "Only Video", "2026-01-01T10:00:00+00:00", quality=480)
+    video["media_type"] = "video"
+    _inject([video])
+
+    cli._print_existing({"id": "AAA"}, media_type="audio")
+    out = capsys.readouterr().out
+    assert "✓ Audio already downloaded" in out
+    assert "Only Video" not in out
+
+
+def test_show_history_shows_media_type(data_dir, capsys):
+    """History listings distinguish video from audio records."""
+    video = _make_record("AAA", "Video One", "2026-01-01T10:00:00+00:00", quality=480)
+    video["media_type"] = "video"
+    audio = _make_record("AAA", "Audio One", "2026-02-01T10:00:00+00:00")
+    audio["media_type"] = "audio"
+    audio["quality"] = None
+    _inject([video, audio])
+
+    cli.show_history()
+    out = capsys.readouterr().out
+    assert "Media Type : video" in out
+    assert "Media Type : audio" in out
+
+
+def test_show_history_detail_shows_media_type(data_dir, capsys):
+    audio = _make_record("AAA", "Audio Detail", "2026-01-01T10:00:00+00:00")
+    audio["media_type"] = "audio"
+    audio["quality"] = None
+    _inject([audio])
+
+    cli.show_history_detail("AAA")
+    out = capsys.readouterr().out
+    assert "Media Type  : audio" in out
+
+
+def test_search_history_shows_media_type(data_dir, capsys):
+    video = _make_record("AAA", "Searchable Video", "2026-01-01T10:00:00+00:00", quality=720)
+    video["media_type"] = "video"
+    _inject([video])
+
+    cli.search_history("Searchable")
+    out = capsys.readouterr().out
+    assert "Media Type : video" in out

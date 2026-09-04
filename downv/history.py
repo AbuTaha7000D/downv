@@ -127,20 +127,22 @@ def count_history() -> int:
 
 
 def remove_download(video_id: str) -> dict | None:
-    """Remove the history metadata for ``video_id`` and return the removed record.
+    """Remove every history record for ``video_id`` and return the first removed.
 
-    Only the metadata is removed; the corresponding media file is never
+    A single media identity can have several records (one per ``media_type``,
+    e.g. its video and its audio), so this removes all of them for the given
+    id. Only the metadata is removed; the corresponding media files are never
     deleted. If the video has no record, no change is made and None is returned.
     """
     if not video_id:
         return None
     downloads = _load()
-    for index, existing in enumerate(downloads):
-        if existing.get("video_id") == video_id:
-            removed = downloads.pop(index)
-            _save(downloads)
-            return removed
-    return None
+    removed = [r for r in downloads if r.get("video_id") == video_id]
+    if not removed:
+        return None
+    downloads = [r for r in downloads if r.get("video_id") != video_id]
+    _save(downloads)
+    return removed[0]
 
 
 def clear_history() -> None:

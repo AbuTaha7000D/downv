@@ -203,3 +203,69 @@ def test_keyboard_interrupt_with_output_flag_still_130(monkeypatch, tmp_path, ca
 
     monkeypatch.setattr(cli, "prompt_for_url", raise_interrupt)
     assert cli.main() == 130
+
+
+# --------------------------------------------------------------------------- #
+# 11. Playlist honours DOWNV_OUTPUT_DIR (Phase 11 finding 2 regression)
+# --------------------------------------------------------------------------- #
+
+
+def _playlist_dirs(monkeypatch, tmp_path, argv):
+    """Drive a playlist download and return the dirs each item is written to."""
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(cli, "_read_line", lambda p: "y")
+    monkeypatch.setattr(cli, "prompt_for_url", lambda: "https://example.com/pl")
+    monkeypatch.setattr(cli, "get_media_info", lambda u: {
+        "_type": "playlist",
+        "title": "PlaylistT",
+        "playlist_count": 2,
+        "entries": [
+            {"id": "v1", "title": "One", "webpage_url": "https://e/v1"},
+            {"id": "v2", "title": "Two", "webpage_url": "https://e/v2"},
+        ],
+    })
+    monkeypatch.setattr(cli, "_resolve_playlist_entry", lambda e: e)
+    monkeypatch.setattr(cli, "select_formats", lambda i: {480: _selected()})
+    monkeypatch.setattr(cli, "select_quality", lambda q: q[480])
+    monkeypatch.setattr(cli, "find_existing_download", lambda i: None)
+    seen_dirs = []
+    monkeypatch.setattr(
+        cli, "download_media",
+        lambda info, selected, output_dir: seen_dirs.append(output_dir)
+        or (output_dir / f"{info.get('id', 'x')}.mp4"),
+    )
+    cli.main()
+    return seen_dirs
+
+
+def test_playlist_uses_env_var_output_dir(monkeypatch, tmp_path, capsys):
+    """DOWNV_OUTPUT_DIR alone drives the base for playlist subdirectories."""
+    env_dir = tmp_path / "env-playlist"
+    monkeypatch.setenv("DOWNV_OUTPUT_DIR", str(env_dir))
+    seen = _playlist_dirs(monkeypatch, tmp_path, ["downv"])
+    playlist_dir = env_dir / "PlaylistT"
+    assert len(seen) == 2
+    assert all(d == playlist_dir for d in seen)
+
+
+def test_playlist_cli_flag_wins_over_env_output_dir(monkeypatch, tmp_path, capsys):
+    """--output takes precedence over DOWNV_OUTPUT_DIR for playlists too."""
+    env_dir = tmp_path / "env-playlist"
+    cli_dir = tmp_path / "cli-playlist"
+    monkeypatch.setenv("DOWNV_OUTPUT_DIR", str(env_dir))
+    monkeypatch.setattr(sys, "argv", ["downv", "--output", str(cli_dir)])
+    seen = _playlist_dirs(monkeypatch, tmp_path, ["downv", "--output", str(cli_dir)])
+    playlist_dir = cli_dir / "PlaylistT"
+    assert len(seen) == 2
+    assert all(d == playlist_dir for d in seen)
+    assert not (env_dir / "PlaylistT").exists()
+
+
+def test_playlist_uses_default_dir_without_override_or_env(monkeypatch, tmp_path, capsys):
+    """With no --output and no DOWNV_OUTPUT_DIR, the default base is used."""
+    monkeypatch.delenv("DOWNV_OUTPUT_DIR", raising=False)
+    monkeypatch.setattr(cli, "resolve_output_directory", lambda: tmp_path)
+    seen = _playlist_dirs(monkeypatch, tmp_path, ["downv"])
+    playlist_dir = tmp_path / "PlaylistT"
+    assert len(seen) == 2
+    assert all(d == playlist_dir for d in seen)

@@ -1,9 +1,11 @@
 """CLI entry point for DownV."""
 
+import logging
 import os
 import re
 import sys
 import termios
+import traceback
 import tty
 from pathlib import Path
 from typing import Dict
@@ -12,12 +14,14 @@ from yt_dlp.utils import sanitize_filename
 
 from downv import history
 from downv import __version__
+from downv import downloader
 from downv.downloader import (
     DownloadFailure,
     download_audio,
     download_media,
     ffmpeg_available,
     find_existing_download,
+    set_verbose,
 )
 from downv.extractor import MediaInfoError, get_media_info
 from downv.formats import (
@@ -332,9 +336,17 @@ def _print_existing(info: dict, media_type: str = "video") -> None:
         print()
         print(f"Warning: {exc}")
         return
-    if not records:
+    record = None
+    # Match on video_id + media_type (mirroring find_existing_download) so a
+    # video duplicate never cross-displays the audio record of the same media
+    # that happened to be stored later, and vice versa. Scan from the newest
+    # stored record for the first one of the requested type.
+    for candidate in reversed(records):
+        if candidate.get("media_type", "video") == media_type:
+            record = candidate
+            break
+    if record is None:
         return
-    record = records[-1]
     title = record.get("title", "Unknown")
     quality = record.get("quality")
     quality_str = f"{quality}p" if quality else "n/a"
@@ -367,6 +379,7 @@ def show_history_detail(video_id: str) -> None:
 
     print(f"Title       : {title}")
     print(f"Video ID    : {record.get('video_id', '?')}")
+    print(f"Media Type  : {record.get('media_type', 'video')}")
     print(f"Quality     : {quality_str}")
     duration = record.get("duration")
     print(f"Duration    : {format_duration(duration) if duration else 'Unknown'}")
@@ -408,6 +421,7 @@ def search_history(query: str) -> None:
         downloaded_at = record.get("downloaded_at", "unknown")
         print(f"- {title}")
         print(f"  Video ID   : {video_id}")
+        print(f"  Media Type : {record.get('media_type', 'video')}")
         print(f"  Quality    : {quality_str}")
         print(f"  Status     : {_file_status(record)}")
         print(f"  Downloaded : {downloaded_at}")
@@ -440,6 +454,7 @@ def show_history() -> None:
         downloaded_at = record.get("downloaded_at", "unknown")
         print(f"- {title}")
         print(f"  Video ID   : {video_id}")
+        print(f"  Media Type : {record.get('media_type', 'video')}")
         print(f"  Quality    : {quality_str}")
         print(f"  Status     : {_file_status(record)}")
         print(f"  Downloaded : {downloaded_at}")
@@ -863,7 +878,7 @@ def _playlist_output_dir(title: str, base: Path | None = None) -> Path:
     ``<base>/<Safe Playlist Title>/``. When ``base`` is None the default output
     directory is used.
     """
-    base_dir = base if base is not None else get_output_directory()
+    base_dir = base if base is not None else resolve_output_directory()
     target = base_dir / playlist_dir_name(title)
     try:
         target.mkdir(parents=True, exist_ok=True)
@@ -1320,6 +1335,22 @@ def _debug(message: str, verbose: bool) -> None:
         print(f"[DEBUG] {message}")
 
 
+def _enable_verbose_logging() -> None:
+    """Route yt-dlp's diagnostics (via the ``downv.downloader`` logger) to stderr.
+
+    Called once at the start of a verbose run so that low-level framework
+    output is visible without ever appearing in normal (non-verbose) CLI
+    output. A handler is only attached when the logger has none, so repeated
+    calls or test capture setups do not produce duplicate lines.
+    """
+    logger = logging.getLogger("downv.downloader")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(handler)
+
+
 def _run_download(
     base: Path | None = None,
     url: str | None = None,
@@ -1328,6 +1359,9 @@ def _run_download(
     quality: int | None = None,
     audio: bool = False,
 ) -> None:
+    set_verbose(verbose)
+    if verbose:
+        _enable_verbose_logging()
     print("DownV - Media Downloader")
     _debug("Verbose mode enabled", verbose)
     if quality is not None:
@@ -1610,6 +1644,12 @@ def _main() -> int | None:
             else:
                 show_history_count()
             return
+        if len(remaining) >= 2 and remaining[1] == "detail":
+            if len(remaining) >= 3:
+                show_history_detail(remaining[2])
+            else:
+                print("Usage: downv history detail <video_id>")
+            return
         if len(remaining) >= 2:
             show_history_detail(remaining[1])
         else:
@@ -1648,6 +1688,8 @@ def main() -> int:
         return 130
     except Exception as exc:
         print(f"Error: {exc}")
+        if downloader._VERBOSE:
+            traceback.print_exc()
         return 1
 
 
